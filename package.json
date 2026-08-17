@@ -1,0 +1,21 @@
+{
+  "name": "jiabei-backend",
+  "version": "1.0.0",
+  "description": "加贝英语台 · 云端 OCR / ASR 代理（持有 API key，避免泄露到前端）。无 key 时 OCR 自动回退本地 Tesseract。",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
+    "multer": "^1.4.5-lts.1"
+  },
+  "optionalDependencies": {
+    "tesseract.js": "^5.1.1"
+  }
+}
