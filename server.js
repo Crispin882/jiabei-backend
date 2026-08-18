@@ -6,6 +6,9 @@
  * 关键：API Key 只存在本服务端（.env），绝不进前端，避免泄露。
  */
 require('dotenv').config();
+// 把任何未捕获的崩溃打到 Render 日志，避免“静默 502”
+process.on('unhandledRejection', e => console.error('[CRASH] UNHANDLED_REJECTION:', e && e.stack || e));
+process.on('uncaughtException', e => console.error('[CRASH] UNCAUGHT_EXCEPTION:', e && e.stack || e));
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -87,6 +90,7 @@ async function callQwenVision(dataUri) {
   };
   const r = await fetch(url, {
     method: 'POST',
+    signal: AbortSignal.timeout(30000),
     headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
@@ -105,6 +109,7 @@ async function callDoubaoVision(dataUri) {
   };
   const r = await fetch(url, {
     method: 'POST',
+    signal: AbortSignal.timeout(30000),
     headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
@@ -133,6 +138,7 @@ async function asrQwen(buf, ext) {
   form.append('task', JSON.stringify({ model: ASR_MODEL, input: { file_urls: [] }, parameters: { language_hints: ['zh', 'en'] } }));
   const r = await fetch('https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription', {
     method: 'POST',
+    signal: AbortSignal.timeout(30000),
     headers: { 'Authorization': 'Bearer ' + API_KEY, 'X-DashScope-Async': 'enable' },
     body: form
   });
@@ -143,6 +149,7 @@ async function asrQwen(buf, ext) {
   for (let i = 0; i < 40; i++) {
     await sleep(1000);
     const s = await fetch('https://dashscope.aliyuncs.com/api/v1/tasks/' + taskId, {
+      signal: AbortSignal.timeout(10000),
       headers: { 'Authorization': 'Bearer ' + API_KEY }
     });
     const sj = await s.json();
@@ -213,8 +220,14 @@ app.get('/', (req, res) => {
     <p>接口：<code>POST /ocr</code>（照片→4字段）　<code>POST /asr</code>（录音→文本）</p>
     <p>状态：<span class="ok">服务正常</span></p>
   </div>
-  <p class="muted">把本地址（含端口）填到「加贝英语台 → 设置 → 云端服务地址」即可。手机访问需用内网穿透（如 cloudflared / localtunnel）把本机 3000 端口暴露到公网。</p>
+  <p class="muted">把本地址（含端口）填到「加贝英语台 → 设置 → 云端服务地址」即可。本服务已托管在云端，手机直接访问，无需内网穿透。</p>
   </body></html>`);
+});
+
+// 兜底错误中间件：任何未处理异常都返回 JSON，避免进程崩溃导致 502
+app.use((err, req, res, next) => {
+  console.error('[CRASH] EXPRESS_ERROR:', err && err.stack || err);
+  if (!res.headersSent) res.status(500).json({ error: err && err.message || String(err) });
 });
 
 if (require.main === module) {
