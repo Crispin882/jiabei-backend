@@ -333,11 +333,18 @@ app.get('/tts', async (req, res) => {
       const m = (j.error && (j.error.message || JSON.stringify(j.error))) || j.message || JSON.stringify(j);
       throw new Error('云端 TTS 失败：' + m);
     }
-    const audioUrl = (j.output && j.output.audio_url) || j.audio_url;
+    const audioObj = (j.output && j.output.audio) || {};
+    const audioUrl = audioObj.url || audioObj.data || j.audio_url || (j.output && j.output.audio_url);
     if (audioUrl) {
+      if (/^data:/.test(audioUrl)) {
+        const b64 = audioUrl.split(',')[1] || '';
+        const buf = Buffer.from(b64, 'base64');
+        res.set('Content-Type', 'audio/wav');
+        return res.send(buf);
+      }
       const ar = await fetch(audioUrl);
       const buf = Buffer.from(await ar.arrayBuffer());
-      res.set('Content-Type', 'audio/wav');
+      res.set('Content-Type', ar.headers.get('content-type') || 'audio/wav');
       return res.send(buf);
     }
     throw new Error('云端 TTS 未返回音频：' + JSON.stringify(j).slice(0, 200));
