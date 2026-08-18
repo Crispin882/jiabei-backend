@@ -140,14 +140,29 @@ async function localOCR(buf, mime) {
 
 /* ---------- 语音识别：通义 Paraformer（异步轮询）---------- */
 async function asrQwen(buf, ext) {
-  const form = new FormData();
-  form.append('file', new Blob([buf], { type: mimeFromExt(ext) }), 'rec.' + ext);
-  form.append('task', JSON.stringify({ model: ASR_MODEL, input: { file_urls: [] }, parameters: { language_hints: ['zh', 'en'] } }));
+  // 1) 先把录音上传到 dashscope 文件服务拿到 file_id（闭环内，不落第三方，隐私安全）
+  const upForm = new FormData();
+  upForm.append('files', new Blob([buf], { type: mimeFromExt(ext) }), 'rec.' + ext);
+  const up = await fetch('https://dashscope.aliyuncs.com/api/v1/files', {
+    method: 'POST',
+    signal: AbortSignal.timeout(30000),
+    headers: { 'Authorization': 'Bearer ' + API_KEY },
+    body: upForm
+  });
+  const upj = await up.json();
+  const fileId = upj.data && upj.data.uploaded_files && upj.data.uploaded_files[0] && upj.data.uploaded_files[0].file_id;
+  if (!fileId) throw new Error('音频上传失败：' + JSON.stringify(upj));
+  // 2) 提交转写任务，用 file:// 引用刚上传的文件
+  const taskBody = {
+    model: ASR_MODEL,
+    input: { file_urls: ['file://' + fileId] },
+    parameters: { language_hints: ['zh', 'en'] }
+  };
   const r = await fetch('https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription', {
     method: 'POST',
     signal: AbortSignal.timeout(30000),
-    headers: { 'Authorization': 'Bearer ' + API_KEY, 'X-DashScope-Async': 'enable' },
-    body: form
+    headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json', 'X-DashScope-Async': 'enable' },
+    body: JSON.stringify(taskBody)
   });
   const j = await r.json();
   if (j.code) throw new Error(j.message || JSON.stringify(j));
