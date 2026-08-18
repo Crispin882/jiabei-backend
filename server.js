@@ -84,9 +84,16 @@ async function visionOCR(buf, mime) {
 
 async function callQwenVision(dataUri) {
   const url = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
+  // 兼容模式(OpenAI 格式)要求图像用 image_url 结构，不能用原生 {image:...}
   const body = {
     model: VISION_MODEL,
-    messages: [{ role: 'user', content: [{ image: dataUri }, { text: OCR_PROMPT }] }]
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: dataUri } },
+        { type: 'text', text: OCR_PROMPT }
+      ]
+    }]
   };
   const r = await fetch(url, {
     method: 'POST',
@@ -188,9 +195,23 @@ app.post('/ocr', upload.single('file'), (req, res) => {
     try {
       let words, source;
       if (API_KEY && VISION_PROVIDER !== 'none') {
-        try { words = await visionOCR(buf, mime); source = 'vision:' + VISION_PROVIDER; }
-        catch (e) { words = await localOCR(buf, mime); source = 'local-tesseract(fallback:' + e.message + ')'; }
-      } else { words = await localOCR(buf, mime); source = 'local-tesseract(no-key)'; }
+        try {
+          words = await visionOCR(buf, mime);
+          source = 'vision:' + VISION_PROVIDER;
+        } catch (e) {
+          // 云端优先走视觉模型；失败直接报错，不再 fallback 本地 tesseract（Render 上 wasm 会崩溃）
+          finishTask(id, { status: 'error', error: '云端视觉识别失败：' + (e && e.message || e) + '（请检查 API Key 是否有效、模型 ' + VISION_MODEL + ' 是否已开通）' });
+          return;
+        }
+      } else {
+        try {
+          words = await localOCR(buf, mime);
+          source = 'local-tesseract(no-key)';
+        } catch (e) {
+          finishTask(id, { status: 'error', error: e.message || String(e) });
+          return;
+        }
+      }
       finishTask(id, { status: 'done', words: words || [], source });
     } catch (e) { finishTask(id, { status: 'error', error: e.message || String(e) }); }
   })();
