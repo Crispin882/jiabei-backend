@@ -306,6 +306,46 @@ app.get('/asr/status/:id', (req, res) => {
   res.json(t);
 });
 
+/* ---------- 整句 TTS：复用 DashScope key，合成整句英文（有道 dictvoice 不支持整句）---------- */
+app.get('/tts', async (req, res) => {
+  if (!API_KEY) return res.status(400).json({ error: 'no-key', message: '未配置 API_KEY，无法使用云端整句发音（请在 .env 配置 DashScope key，并已开通“语音合成”）' });
+  const text = String(req.query.text || '').slice(0, 500).trim();
+  if (!text) return res.status(400).json({ error: 'empty', message: '文本为空' });
+  const model = process.env.TTS_MODEL || 'qwen-audio-3.0-tts-flash';
+  const voice = process.env.TTS_VOICE || 'longanhuan_v3.6';
+  const host = process.env.TTS_HOST || 'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer';
+  try {
+    const r = await fetch(host, {
+      method: 'POST',
+      signal: AbortSignal.timeout(30000),
+      headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, input: { text }, parameters: { voice, format: 'wav', sample_rate: 24000 } })
+    });
+    const ct = r.headers.get('content-type') || '';
+    if (ct.includes('audio')) {
+      const buf = Buffer.from(await r.arrayBuffer());
+      res.set('Content-Type', ct.split(';')[0]);
+      return res.send(buf);
+    }
+    // 非流式可能返回 JSON（含 audio_url）或错误
+    const j = await r.json().catch(() => ({}));
+    if (j.code || j.error) {
+      const m = (j.error && (j.error.message || JSON.stringify(j.error))) || j.message || JSON.stringify(j);
+      throw new Error('云端 TTS 失败：' + m);
+    }
+    const audioUrl = (j.output && j.output.audio_url) || j.audio_url;
+    if (audioUrl) {
+      const ar = await fetch(audioUrl);
+      const buf = Buffer.from(await ar.arrayBuffer());
+      res.set('Content-Type', 'audio/wav');
+      return res.send(buf);
+    }
+    throw new Error('云端 TTS 未返回音频：' + JSON.stringify(j).slice(0, 200));
+  } catch (e) {
+    res.status(502).json({ error: 'tts-failed', message: e.message || String(e) });
+  }
+});
+
 app.get('/', (req, res) => {
   const hasKey = !!API_KEY;
   res.type('html').send(`<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>加贝后端自检</title>
