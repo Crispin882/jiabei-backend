@@ -13,6 +13,7 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -139,23 +140,11 @@ async function localOCR(buf, mime) {
 }
 
 /* ---------- 语音识别：通义 Paraformer（异步轮询）---------- */
-async function asrQwen(buf, ext) {
-  // 1) 先把录音上传到 dashscope 文件服务拿到 file_id（闭环内，不落第三方，隐私安全）
-  const upForm = new FormData();
-  upForm.append('files', new Blob([buf], { type: mimeFromExt(ext) }), 'rec.' + ext);
-  const up = await fetch('https://dashscope.aliyuncs.com/api/v1/files', {
-    method: 'POST',
-    signal: AbortSignal.timeout(30000),
-    headers: { 'Authorization': 'Bearer ' + API_KEY },
-    body: upForm
-  });
-  const upj = await up.json();
-  const fileId = upj.data && upj.data.uploaded_files && upj.data.uploaded_files[0] && upj.data.uploaded_files[0].file_id;
-  if (!fileId) throw new Error('音频上传失败：' + JSON.stringify(upj));
-  // 2) 提交转写任务，用 file:// 引用刚上传的文件
+async function asrQwen(audioUrl) {
+  // dashscope transcription 接口只接受公网 URL（不支持 file://），audioUrl 为后端中转公网地址
   const taskBody = {
     model: ASR_MODEL,
-    input: { file_urls: ['file://' + fileId] },
+    input: { file_urls: [audioUrl] },
     parameters: { language_hints: ['zh', 'en'] }
   };
   const r = await fetch('https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription', {
@@ -168,7 +157,7 @@ async function asrQwen(buf, ext) {
   if (j.code) throw new Error(j.message || JSON.stringify(j));
   const taskId = j.output && j.output.task_id;
   if (!taskId) throw new Error('创建识别任务失败：' + JSON.stringify(j));
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < 50; i++) {
     await sleep(1000);
     const s = await fetch('https://dashscope.aliyuncs.com/api/v1/tasks/' + taskId, {
       signal: AbortSignal.timeout(10000),
@@ -177,11 +166,15 @@ async function asrQwen(buf, ext) {
     const sj = await s.json();
     const st = sj.output && sj.output.task_status;
     if (st === 'SUCCEEDED') {
-      const url = sj.output.results && sj.output.results[0] && sj.output.results[0].transcription_url;
-      const t = await (await fetch(url)).json();
+      const resultUrl = sj.output.results && sj.output.results[0] && sj.output.results[0].transcription_url;
+      if (!resultUrl) throw new Error('转写完成但无结果地址');
+      const t = await (await fetch(resultUrl)).json();
       return (t.transcripts && t.transcripts[0] && t.transcripts[0].text) || t.text || '';
     }
-    if (st === 'FAILED') throw new Error('识别失败');
+    if (st === 'FAILED') {
+      const detail = (sj.output && (sj.output.message || sj.output.task_status_message)) || sj.message || JSON.stringify(sj).slice(0, 200);
+      throw new Error('识别失败：' + detail);
+    }
   }
   throw new Error('识别超时');
 }
@@ -200,6 +193,12 @@ function newTask() {
 }
 function finishTask(id, patch) { const t = tasks.get(id); if (t) Object.assign(t, patch); }
 function consumeTask(id) { const t = tasks.get(id); if (t) { if (t.status === 'done' || t.status === 'error') tasks.delete(id); } return t; }
+
+// 临时音频中转：录音以随机 token 存内存，暴露公开 GET 路由，供 dashscope 下载转写
+// 原因：dashscope transcription 接口只接受公网 URL，不支持 file:// 引用，故用本服务公网地址中转
+const audioStore = new Map(); // token -> { buf, ext, ts }
+function setAudio(token, buf, ext) { audioStore.set(token, { buf, ext, ts: Date.now() }); if (audioStore.size > 100) { const k = audioStore.keys().next().value; audioStore.delete(k); } }
+function getAudio(token) { const a = audioStore.get(token); if (a) audioStore.delete(token); return a; }
 
 /* ---------- 路由 ---------- */
 /* 诊断接口：返回 API Key 脱敏元信息，不暴露完整 Key，用于排查「Incorrect API key」 */
@@ -271,11 +270,29 @@ app.post('/asr', upload.single('file'), (req, res) => {
   }
   const id = newTask();
   const buf = req.file.buffer, ext = (req.file.originalname.split('.').pop() || 'webm').toLowerCase();
+  // 以随机 token 落地内存，构造公网 URL 供 dashscope 下载（transcription 仅支持公网 URL）
+  const token = crypto.randomBytes(12).toString('hex');
+  setAudio(token, buf, ext);
+  const audioUrl = 'https://' + req.get('host') + '/audio/' + token;
   (async () => {
-    try { const text = await asrQwen(buf, ext); finishTask(id, { status: 'done', text: text || '' }); }
-    catch (e) { finishTask(id, { status: 'error', error: e.message || String(e) }); }
+    try {
+      const text = await asrQwen(audioUrl);
+      finishTask(id, { status: 'done', text: text || '' });
+    } catch (e) {
+      finishTask(id, { status: 'error', error: e.message || String(e) });
+    } finally {
+      getAudio(token); // 无论成败都清理中转音频
+    }
   })();
   res.status(202).json({ taskId: id, status: 'processing' });
+});
+
+// dashscope 下载中转音频（token 用后即焚，不可猜）
+app.get('/audio/:token', (req, res) => {
+  const a = getAudio(req.params.token);
+  if (!a) return res.status(404).end();
+  res.set('Content-Type', mimeFromExt(a.ext));
+  res.send(Buffer.from(a.buf));
 });
 
 app.get('/asr/status/:id', (req, res) => {
