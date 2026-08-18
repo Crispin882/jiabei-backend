@@ -187,6 +187,22 @@ function finishTask(id, patch) { const t = tasks.get(id); if (t) Object.assign(t
 function consumeTask(id) { const t = tasks.get(id); if (t) { if (t.status === 'done' || t.status === 'error') tasks.delete(id); } return t; }
 
 /* ---------- 路由 ---------- */
+/* 诊断接口：返回 API Key 脱敏元信息，不暴露完整 Key，用于排查「Incorrect API key」 */
+app.get('/diag', (req, res) => {
+  const k = API_KEY || '';
+  const effSource = process.env.API_KEY ? 'API_KEY'
+    : process.env.DASHSCOPE_API_KEY ? 'DASHSCOPE_API_KEY' : 'none';
+  res.json({
+    hasApiKey: !!k, keyLen: k.length,
+    keyPrefix: k.slice(0, 6), keySuffix: k.slice(-4),
+    looksLikeDashscope: k.startsWith('sk-'),
+    effectiveSource: effSource,
+    apiKeySet: !!process.env.API_KEY,
+    dashscopeKeySet: !!process.env.DASHSCOPE_API_KEY,
+    visionProvider: VISION_PROVIDER, visionModel: VISION_MODEL, asrModel: ASR_MODEL
+  });
+});
+
 app.post('/ocr', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: '未收到图片' });
   const id = newTask();
