@@ -90,7 +90,7 @@ async function callQwenVision(dataUri) {
   };
   const r = await fetch(url, {
     method: 'POST',
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(60000),
     headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
@@ -168,42 +168,69 @@ function mimeFromExt(ext) {
   return ({ wav: 'audio/wav', mp3: 'audio/mpeg', pcm: 'audio/pcm', flac: 'audio/flac', m4a: 'audio/mp4', webm: 'audio/webm', ogg: 'audio/ogg' }[ext] || 'audio/webm');
 }
 
+/* ---------- 异步任务（避免 Render 代理 25-30s 超时导致 502）---------- */
+const tasks = new Map();
+function newTask() {
+  const id = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  tasks.set(id, { status: 'processing', startedAt: Date.now() });
+  if (tasks.size > 200) tasks.delete(tasks.keys().next().value);
+  return id;
+}
+function finishTask(id, patch) { const t = tasks.get(id); if (t) Object.assign(t, patch); }
+function consumeTask(id) { const t = tasks.get(id); if (t) { if (t.status === 'done' || t.status === 'error') tasks.delete(id); } return t; }
+
 /* ---------- 路由 ---------- */
-app.post('/ocr', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: '未收到图片' });
-    let words, source;
-    if (API_KEY && VISION_PROVIDER !== 'none') {
-      try {
-        words = await visionOCR(req.file.buffer, req.file.mimetype);
-        source = 'vision:' + VISION_PROVIDER;
-      } catch (e) {
-        // 视觉失败，回退本地
-        words = await localOCR(req.file.buffer, req.file.mimetype);
-        source = 'local-tesseract(fallback:' + e.message + ')';
-      }
-    } else {
-      words = await localOCR(req.file.buffer, req.file.mimetype);
-      source = 'local-tesseract(no-key)';
-    }
-    res.json({ words: words || [], source });
-  } catch (e) {
-    res.status(500).json({ error: e.message || String(e) });
-  }
+app.post('/ocr', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: '未收到图片' });
+  const id = newTask();
+  const buf = req.file.buffer, mime = req.file.mimetype;
+  (async () => {
+    try {
+      let words, source;
+      if (API_KEY && VISION_PROVIDER !== 'none') {
+        try { words = await visionOCR(buf, mime); source = 'vision:' + VISION_PROVIDER; }
+        catch (e) { words = await localOCR(buf, mime); source = 'local-tesseract(fallback:' + e.message + ')'; }
+      } else { words = await localOCR(buf, mime); source = 'local-tesseract(no-key)'; }
+      finishTask(id, { status: 'done', words: words || [], source });
+    } catch (e) { finishTask(id, { status: 'error', error: e.message || String(e) }); }
+  })();
+  res.status(202).json({ taskId: id, status: 'processing' });
 });
 
-app.post('/asr', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: '未收到音频' });
-    if (!API_KEY || ASR_PROVIDER === 'none') {
-      return res.status(400).json({ error: 'no-key', message: '未配置云端语音识别，请改用浏览器识别或在 .env 配置 ASR_PROVIDER=qwen 与 API_KEY。' });
-    }
-    const ext = (req.file.originalname.split('.').pop() || 'webm').toLowerCase();
-    const text = await asrQwen(req.file.buffer, ext);
-    res.json({ text: text || '' });
-  } catch (e) {
-    res.status(500).json({ error: e.message || String(e) });
+app.get('/ocr/status/:id', (req, res) => {
+  const t = tasks.get(req.params.id);
+  if (!t) return res.status(404).json({ error: '任务不存在或已过期，请重试' });
+  if (t.status === 'processing' && Date.now() - t.startedAt > 120000) {
+    tasks.delete(req.params.id);
+    return res.status(408).json({ error: '识别超时（模型响应过慢），请用「批量导入」粘贴 AI 文本，或稍后重试' });
   }
+  consumeTask(req.params.id);
+  res.json(t);
+});
+
+app.post('/asr', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: '未收到音频' });
+  if (!API_KEY || ASR_PROVIDER === 'none') {
+    return res.status(400).json({ error: 'no-key', message: '未配置云端语音识别，请改用浏览器识别或在 .env 配置 ASR_PROVIDER=qwen 与 API_KEY。' });
+  }
+  const id = newTask();
+  const buf = req.file.buffer, ext = (req.file.originalname.split('.').pop() || 'webm').toLowerCase();
+  (async () => {
+    try { const text = await asrQwen(buf, ext); finishTask(id, { status: 'done', text: text || '' }); }
+    catch (e) { finishTask(id, { status: 'error', error: e.message || String(e) }); }
+  })();
+  res.status(202).json({ taskId: id, status: 'processing' });
+});
+
+app.get('/asr/status/:id', (req, res) => {
+  const t = tasks.get(req.params.id);
+  if (!t) return res.status(404).json({ error: '任务不存在或已过期，请重试' });
+  if (t.status === 'processing' && Date.now() - t.startedAt > 90000) {
+    tasks.delete(req.params.id);
+    return res.status(408).json({ error: '识别超时，请稍后重试或用「我已大声朗读」记录' });
+  }
+  consumeTask(req.params.id);
+  res.json(t);
 });
 
 app.get('/', (req, res) => {
