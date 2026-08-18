@@ -22,7 +22,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 
 const PORT = process.env.PORT || 3000;
 const VISION_PROVIDER = (process.env.VISION_PROVIDER || 'qwen').toLowerCase();
 const ASR_PROVIDER = (process.env.ASR_PROVIDER || 'qwen').toLowerCase();
-const API_KEY = process.env.API_KEY || process.env.DASHSCOPE_API_KEY || '';
+const API_KEY = (process.env.API_KEY || process.env.DASHSCOPE_API_KEY || '').trim();
 const VISION_MODEL = process.env.VISION_MODEL || 'qwen3-vl-plus';
 const ASR_MODEL = process.env.ASR_MODEL || 'paraformer-v2';
 const ARK_ENDPOINT = process.env.ARK_ENDPOINT || '';
@@ -102,7 +102,7 @@ async function callQwenVision(dataUri) {
     body: JSON.stringify(body)
   });
   const j = await r.json();
-  if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+  if (j.error) { const c = j.error.code || ''; throw new Error(`云端视觉识别失败[${c}]：${j.error.message || JSON.stringify(j.error)}`); }
   const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content || '';
   return extractWords(content);
 }
@@ -189,11 +189,15 @@ function consumeTask(id) { const t = tasks.get(id); if (t) { if (t.status === 'd
 /* ---------- 路由 ---------- */
 /* 诊断接口：返回 API Key 脱敏元信息，不暴露完整 Key，用于排查「Incorrect API key」 */
 app.get('/diag', (req, res) => {
-  const k = API_KEY || '';
+  const raw = process.env.API_KEY || process.env.DASHSCOPE_API_KEY || '';
+  const k = raw.trim();
   const effSource = process.env.API_KEY ? 'API_KEY'
     : process.env.DASHSCOPE_API_KEY ? 'DASHSCOPE_API_KEY' : 'none';
   res.json({
-    hasApiKey: !!k, keyLen: k.length,
+    hasApiKey: !!k,
+    rawKeyLen: raw.length,                 // 原始（可能含 \r\n 等不可见字符）
+    keyLen: k.length,                      // 清理首尾空白后
+    hasInvisibleChars: raw.length !== k.length || /[\r\n\t]/.test(raw),
     keyPrefix: k.slice(0, 6), keySuffix: k.slice(-4),
     looksLikeDashscope: k.startsWith('sk-'),
     effectiveSource: effSource,
