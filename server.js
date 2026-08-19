@@ -14,6 +14,8 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const crypto = require('crypto');
+const http = require('http');
+const { WebSocketServer, WebSocket } = require('ws');
 
 const app = express();
 app.use(cors());
@@ -27,6 +29,9 @@ const API_KEY = (process.env.API_KEY || process.env.DASHSCOPE_API_KEY || '').tri
 const VISION_MODEL = process.env.VISION_MODEL || 'qwen3-vl-plus';
 const ASR_MODEL = process.env.ASR_MODEL || 'paraformer-v2';
 const ARK_ENDPOINT = process.env.ARK_ENDPOINT || '';
+// 实时语音识别（paraformer-realtime-v2）业务空间专属域名；WorkspaceId 由用户开通实时服务后提供
+const RT_WORKSPACE = (process.env.DASHSCOPE_WORKSPACE || 'ws-8tkk6xjf5kj0refl').trim();
+const RT_WS_URL = 'wss://' + RT_WORKSPACE + '.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference';
 
 const OCR_PROMPT = `你是一个英语单词卡片识别器。图片里是单词学习卡片，每行形如「单词 /音标/ 词性. 中文意思」（音标和词性可能缺失）。
 请识别并返回 JSON 数组，每个元素包含字段：en(英文单词)、phonetic(国际音标，不要斜杠，如 nekst)、pos(词性缩写如 n./v./adj./adv.)、zh(中文意思)、ex(英文例句，没有就填空字符串)。
@@ -382,9 +387,38 @@ app.use((err, req, res, next) => {
   if (!res.headersSent) res.status(500).json({ error: err && err.message || String(err) });
 });
 
+/* ---------- 实时语音识别 WebSocket 代理（paraformer-realtime-v2） ----------
+ * 浏览器无法直接带 Authorization 头连 DashScope，且 API Key 不能进前端，
+ * 故本服务在 /asr-realtime 做透明转发：前端连本服务，本服务带 Bearer 头连 DashScope。
+ * 前端负责组装协议（run-task / 二进制 PCM / finish-task），本服务只透传字节。
+ */
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/asr-realtime' });
+wss.on('connection', (client) => {
+  console.log('[RT] 客户端已连接，正在转发到 DashScope 实时识别（workspace=' + RT_WORKSPACE + '）');
+  const pending = [];
+  let upOpen = false;
+  const upstream = new WebSocket(RT_WS_URL, {
+    headers: { Authorization: 'Bearer ' + API_KEY, 'user-agent': 'jiabei-backend/1.0' }
+  });
+  upstream.on('open', () => {
+    upOpen = true;
+    while (pending.length) { try { upstream.send(pending.shift()); } catch (_) {} }
+  });
+  upstream.on('message', (data) => { if (client.readyState === WebSocket.OPEN) try { client.send(data); } catch (_) {} });
+  upstream.on('close', () => { if (client.readyState === WebSocket.OPEN) try { client.close(); } catch (_) {} });
+  upstream.on('error', (e) => { console.error('[RT] 上游(DashScope)错误:', e && e.message || e); if (client.readyState === WebSocket.OPEN) try { client.close(); } catch (_) {} });
+  client.on('message', (data) => {
+    if (upOpen && upstream.readyState === WebSocket.OPEN) try { upstream.send(data); } catch (_) {}
+    else pending.push(data); // 上游未开时缓存（如 run-task），开后再发
+  });
+  client.on('close', () => { try { upstream.close(); } catch (_) {} });
+  client.on('error', () => {});
+});
+
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log('[加贝后端] 已启动 http://localhost:' + PORT + '  key=' + (API_KEY ? '已配置' : '未配置') + ' vision=' + VISION_PROVIDER + ' asr=' + ASR_PROVIDER);
+  server.listen(PORT, () => {
+    console.log('[加贝后端] 已启动 http://localhost:' + PORT + '  key=' + (API_KEY ? '已配置' : '未配置') + ' vision=' + VISION_PROVIDER + ' asr=' + ASR_PROVIDER + ' realtime-ws=/asr-realtime');
   });
 }
 
