@@ -169,11 +169,16 @@ async function asrQwen(audioUrl) {
       const resultUrl = sj.output.results && sj.output.results[0] && sj.output.results[0].transcription_url;
       if (!resultUrl) throw new Error('转写完成但无结果地址');
       const t = await (await fetch(resultUrl)).json();
-      return (t.transcripts && t.transcripts[0] && t.transcripts[0].text) || t.text || '';
+      const text = (t.transcripts && t.transcripts[0] && t.transcripts[0].text) || t.text || '';
+      // 没有有效语音时 Paraformer 会返回字面量 “SUCCESS_WITH_NO_VALID_FRAGMENT”，当作空识别（前端提示“没识别到声音”）
+      if (/SUCCESS_WITH_NO_VALID_FRAGMENT|NO_VALID_FRAGMENT/i.test(text)) return '';
+      return text;
     }
     if (st === 'FAILED') {
       const detail = (sj.output && (sj.output.message || sj.output.task_status_message)) || sj.message || JSON.stringify(sj).slice(0, 200);
-      throw new Error('识别失败：' + detail);
+      // 同上：偶尔以 FAILED 形式返回“无片段”，按空识别处理，避免误报成错误
+      if (/SUCCESS_WITH_NO_VALID_FRAGMENT|NO_VALID_FRAGMENT/i.test(detail)) return '';
+      throw new Error(detail); // 不再加“识别失败：”前缀，由前端统一加，避免双重前缀
     }
   }
   throw new Error('识别超时');
