@@ -15,7 +15,14 @@ const multer = require('multer');
 const path = require('path');
 const crypto = require('crypto');
 const http = require('http');
-const { WebSocketServer, WebSocket } = require('ws');
+// 实时语音识别依赖 ws；若未安装，主服务仍正常启动，仅 /asr-realtime 不可用（避免整个进程崩溃导致部署失败）
+let WebSocketServer = null, WebSocket = null, WS_AVAILABLE = false;
+try {
+  ({ WebSocketServer, WebSocket } = require('ws'));
+  WS_AVAILABLE = true;
+} catch (e) {
+  console.warn('[WARN] 未检测到 ws 模块，实时语音识别(/asr-realtime)已禁用。如需“边说边出字”，请执行 `npm install ws` 后重新部署。OCR/ASR/TTS 不受影响。');
+}
 
 const app = express();
 app.use(cors());
@@ -393,28 +400,32 @@ app.use((err, req, res, next) => {
  * 前端负责组装协议（run-task / 二进制 PCM / finish-task），本服务只透传字节。
  */
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/asr-realtime' });
-wss.on('connection', (client) => {
-  console.log('[RT] 客户端已连接，正在转发到 DashScope 实时识别（workspace=' + RT_WORKSPACE + '）');
-  const pending = [];
-  let upOpen = false;
-  const upstream = new WebSocket(RT_WS_URL, {
-    headers: { Authorization: 'Bearer ' + API_KEY, 'user-agent': 'jiabei-backend/1.0' }
+if (WS_AVAILABLE) {
+  const wss = new WebSocketServer({ server, path: '/asr-realtime' });
+  wss.on('connection', (client) => {
+    console.log('[RT] 客户端已连接，正在转发到 DashScope 实时识别（workspace=' + RT_WORKSPACE + '）');
+    const pending = [];
+    let upOpen = false;
+    const upstream = new WebSocket(RT_WS_URL, {
+      headers: { Authorization: 'Bearer ' + API_KEY, 'user-agent': 'jiabei-backend/1.0' }
+    });
+    upstream.on('open', () => {
+      upOpen = true;
+      while (pending.length) { try { upstream.send(pending.shift()); } catch (_) {} }
+    });
+    upstream.on('message', (data) => { if (client.readyState === WebSocket.OPEN) try { client.send(data); } catch (_) {} });
+    upstream.on('close', () => { if (client.readyState === WebSocket.OPEN) try { client.close(); } catch (_) {} });
+    upstream.on('error', (e) => { console.error('[RT] 上游(DashScope)错误:', e && e.message || e); if (client.readyState === WebSocket.OPEN) try { client.close(); } catch (_) {} });
+    client.on('message', (data) => {
+      if (upOpen && upstream.readyState === WebSocket.OPEN) try { upstream.send(data); } catch (_) {}
+      else pending.push(data); // 上游未开时缓存（如 run-task），开后再发
+    });
+    client.on('close', () => { try { upstream.close(); } catch (_) {} });
+    client.on('error', () => {});
   });
-  upstream.on('open', () => {
-    upOpen = true;
-    while (pending.length) { try { upstream.send(pending.shift()); } catch (_) {} }
-  });
-  upstream.on('message', (data) => { if (client.readyState === WebSocket.OPEN) try { client.send(data); } catch (_) {} });
-  upstream.on('close', () => { if (client.readyState === WebSocket.OPEN) try { client.close(); } catch (_) {} });
-  upstream.on('error', (e) => { console.error('[RT] 上游(DashScope)错误:', e && e.message || e); if (client.readyState === WebSocket.OPEN) try { client.close(); } catch (_) {} });
-  client.on('message', (data) => {
-    if (upOpen && upstream.readyState === WebSocket.OPEN) try { upstream.send(data); } catch (_) {}
-    else pending.push(data); // 上游未开时缓存（如 run-task），开后再发
-  });
-  client.on('close', () => { try { upstream.close(); } catch (_) {} });
-  client.on('error', () => {});
-});
+} else {
+  console.warn('[RT] /asr-realtime 未启用（ws 模块缺失）。');
+}
 
 if (require.main === module) {
   server.listen(PORT, () => {
