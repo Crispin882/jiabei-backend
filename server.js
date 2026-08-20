@@ -401,60 +401,49 @@ app.use((err, req, res, next) => {
  */
 const server = http.createServer(app);
 if (WS_AVAILABLE) {
-  // 预热连接池：提前与 DashScope 完成 TCP/TLS/WS 握手，消除每次点“说”的冷启动等待。
-  // 这正是实时识别比普通识别还慢的根因——普通 /asr 走 HTTPS keep-alive 可复用连接，
-  // 而实时识别原本每次都新建 WS 重新握手（跨国产握手尤其慢）。
-  let warmUpstream = null, warmOpening = false;
-  function spawnUpstream(){
-    const up = new WebSocket(RT_WS_URL, { headers: { Authorization: 'Bearer ' + API_KEY, 'user-agent': 'jiabei-backend/1.0' } });
-    up.__ready = false;
-    up.on('open', () => { up.__ready = true; });
-    up.on('error', (e) => { console.error('[RT] 上游(DashScope)错误:', e && e.message || e); try { up.close(); } catch (_) {} });
-    up.on('close', () => { if (warmUpstream === up) warmUpstream = null; });
-    return up;
-  }
-  function refillWarm(){
-    if (warmUpstream || warmOpening) return;
-    warmOpening = true;
-    const up = spawnUpstream();
-    up.on('open', () => { warmUpstream = up; warmOpening = false; });
-    up.on('error', () => { warmOpening = false; });
-    up.on('close', () => { if (warmUpstream === up) warmUpstream = null; warmOpening = false; });
-  }
-  function acquireUpstream(){
-    if (warmUpstream && warmUpstream.readyState === 1 && warmUpstream.__ready) { const u = warmUpstream; warmUpstream = null; return u; }
-    return null;
-  }
-
+  // 每条客户端连接对应一条“浏览器→本服务→DashScope”的透传隧道。
+  // 不用“启动预热连接池”：空闲连接易被 DashScope 静默关闭而 Node 未察觉（readyState 仍 OPEN），
+  // 导致 run-task 发到死连接、永远收不到 task-started。每次新建上游连接虽多一次握手，
+  // 但与“浏览器→后端”握手并行，实际延迟可接受且稳定可靠。
   const wss = new WebSocketServer({ server, path: '/asr-realtime' });
   wss.on('connection', (client) => {
     console.log('[RT] 客户端已连接（workspace=' + RT_WORKSPACE + '）');
-    let current = null, upOpen = false, pending = [];
-    function bindUpstream(up){
-      if (current && current !== up) { try { current.close(); } catch (_) {} }
-      current = up; upOpen = (up.readyState === 1); pending = [];
-      up.on('open', () => { upOpen = true; while (pending.length) { try { up.send(pending.shift()); } catch (_) {} } });
-      up.on('message', (d) => {
+    let upstream = null, upOpen = false, pending = [];
+
+    function openUpstream(){
+      upstream = new WebSocket(RT_WS_URL, {
+        headers: { Authorization: 'Bearer ' + API_KEY, 'user-agent': 'jiabei-backend/1.0', 'X-DashScope-WorkSpace': RT_WORKSPACE }
+      });
+      upstream.on('open', () => {
+        upOpen = true;
+        console.log('[RT] 上游(DashScope)已打开');
+        while (pending.length) { try { upstream.send(pending.shift()); } catch (_) {} }
+      });
+      upstream.on('message', (d) => {
         if (client.readyState !== WebSocket.OPEN) return;
         // DashScope 控制消息可能是 binary frame（内容仍是 JSON），必须转成字符串再转发，
         // 否则浏览器按 Blob 收到后前端 JSON.parse 失败，task-started 被丢弃 → 实时识别永远连不上。
-        const text = (typeof d === 'string') ? d : (Buffer.isBuffer(d) ? d.toString('utf8') : (d && d.toString ? d.toString() : ''));
+        const isBuf = Buffer.isBuffer(d);
+        const text = isBuf ? d.toString('utf8') : (typeof d === 'string' ? d : (d && d.toString ? d.toString() : ''));
         let evName = null; try { const j = JSON.parse(text); evName = j && j.header && j.header.event; } catch (_) {}
         if (evName) console.log('[RT] 收到上游事件: ' + evName);
+        else console.log('[RT] 上游原始消息[' + (isBuf ? 'binary' : 'text') + ']: ' + text.slice(0, 300));
         try { client.send(text); } catch (_) {}
       });
-      up.on('close', () => { /* 不联动关闭客户端，避免误杀；前端有超时兜底 */ });
-      up.on('error', (e) => { console.error('[RT] 上游错误:', e && e.message || e); });
+      upstream.on('close', () => { console.log('[RT] 上游已关闭'); });
+      upstream.on('error', (e) => { console.error('[RT] 上游(DashScope)错误:', e && e.message || e); });
     }
+    openUpstream();
+
     client.on('message', (data) => {
       let action = null; try { const j = JSON.parse(data); action = j && j.header && j.header.action; } catch (_) {}
-      if (action === 'run-task') { bindUpstream(acquireUpstream() || spawnUpstream()); refillWarm(); }
-      if (current) { if (upOpen && current.readyState === WebSocket.OPEN) try { current.send(data); } catch (_) {} else pending.push(data); }
+      if (action === 'run-task') console.log('[RT] 收到客户端 run-task，转发到上游');
+      if (upOpen && upstream && upstream.readyState === WebSocket.OPEN) try { upstream.send(data); } catch (_) {}
+      else pending.push(data);
     });
-    client.on('close', () => { try { if (current) current.close(); } catch (_) {} refillWarm(); });
+    client.on('close', () => { try { if (upstream) upstream.close(); } catch (_) {} });
     client.on('error', () => {});
   });
-  refillWarm(); // 启动即预热一个，首次点击也能秒连
 } else {
   console.warn('[RT] /asr-realtime 未启用（ws 模块缺失）。');
 }
