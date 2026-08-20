@@ -38,7 +38,9 @@ const ASR_MODEL = process.env.ASR_MODEL || 'paraformer-v2';
 const ARK_ENDPOINT = process.env.ARK_ENDPOINT || '';
 // 实时语音识别（paraformer-realtime-v2）业务空间专属域名；WorkspaceId 由用户开通实时服务后提供
 const RT_WORKSPACE = (process.env.DASHSCOPE_WORKSPACE || 'ws-8tkk6xjf5kj0refl').trim();
-const RT_WS_URL = 'wss://' + RT_WORKSPACE + '.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference';
+// 实时识别 WebSocket 地址：默认用业务空间专属域名；若需改用百炼标准地址（非 workspace），
+// 可在 Render 设 DASHSCOPE_RT_URL=wss://dashscope.aliyuncs.com/api-ws/v1/inference/ 覆盖。
+const RT_WS_URL = (process.env.DASHSCOPE_RT_URL || ('wss://' + RT_WORKSPACE + '.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference')).trim();
 
 const OCR_PROMPT = `你是一个英语单词卡片识别器。图片里是单词学习卡片，每行形如「单词 /音标/ 词性. 中文意思」（音标和词性可能缺失）。
 请识别并返回 JSON 数组，每个元素包含字段：en(英文单词)、phonetic(国际音标，不要斜杠，如 nekst)、pos(词性缩写如 n./v./adj./adv.)、zh(中文意思)、ex(英文例句，没有就填空字符串)。
@@ -411,15 +413,19 @@ if (WS_AVAILABLE) {
     let upstream = null, upOpen = false, pending = [];
 
     function openUpstream(){
+      console.log('[RT] 正在连接上游: ' + RT_WS_URL + '  workspace=' + RT_WORKSPACE);
       upstream = new WebSocket(RT_WS_URL, {
         headers: { Authorization: 'Bearer ' + API_KEY, 'user-agent': 'jiabei-backend/1.0', 'X-DashScope-WorkSpace': RT_WORKSPACE }
       });
+      let gotEvent = false, watchdog = null;
       upstream.on('open', () => {
         upOpen = true;
-        console.log('[RT] 上游(DashScope)已打开');
+        console.log('[RT] 上游(DashScope)已打开（握手成功）');
         while (pending.length) { try { upstream.send(pending.shift()); } catch (_) {} }
       });
       upstream.on('message', (d) => {
+        gotEvent = true;
+        if (watchdog) { clearTimeout(watchdog); watchdog = null; }
         if (client.readyState !== WebSocket.OPEN) return;
         // DashScope 控制消息可能是 binary frame（内容仍是 JSON），必须转成字符串再转发，
         // 否则浏览器按 Blob 收到后前端 JSON.parse 失败，task-started 被丢弃 → 实时识别永远连不上。
@@ -430,14 +436,33 @@ if (WS_AVAILABLE) {
         else console.log('[RT] 上游原始消息[' + (isBuf ? 'binary' : 'text') + ']: ' + text.slice(0, 300));
         try { client.send(text); } catch (_) {}
       });
-      upstream.on('close', () => { console.log('[RT] 上游已关闭'); });
+      upstream.on('close', (code, reason) => {
+        if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+        // code 是关键诊断：1000+空 reason=正常关闭；1008/1011=策略/服务错误；
+        // 若发 run-task 后一直无事件、最后被关，多半是模型/workspace 未开通实时识别。
+        console.log('[RT] 上游已关闭 code=' + code + ' reason=' + (reason && reason.toString ? reason.toString() : '(空)'));
+      });
       upstream.on('error', (e) => { console.error('[RT] 上游(DashScope)错误:', e && e.message || e); });
+      upstream.on('unexpected-response', (req, res) => {
+        console.error('[RT] 上游非预期响应 status=' + (res && res.statusCode) + ' —— 握手未成功，可能不是有效的实时识别地址（检查 RT_WS_URL）');
+      });
+      // 看门狗：run-task 转发后若 N 秒无任一上游事件，判定 DashScope 未处理该任务（握手成功但不干活）
+      upstream._watchdogArm = (secs) => {
+        if (watchdog) clearTimeout(watchdog);
+        watchdog = setTimeout(() => {
+          if (!gotEvent) console.warn('[RT][WARN] 已转发 run-task 但 ' + secs + ' 秒内未收到任何上游事件 —— DashScope 很可能未处理该任务（检查：①workspace 是否开通 paraformer-realtime-v2 实时识别；②run-task 字段；③RT_WS_URL 地址是否正确）');
+        }, secs * 1000);
+      };
     }
     openUpstream();
 
     client.on('message', (data) => {
       let action = null; try { const j = JSON.parse(data); action = j && j.header && j.header.action; } catch (_) {}
-      if (action === 'run-task') console.log('[RT] 收到客户端 run-task，转发到上游');
+      if (action === 'run-task') {
+        console.log('[RT] 收到客户端 run-task，转发到上游');
+        console.log('[RT] run-task 内容: ' + (typeof data === 'string' ? data.slice(0, 500) : '[binary]'));
+        if (upstream && upstream._watchdogArm) upstream._watchdogArm(6);
+      }
       if (upOpen && upstream && upstream.readyState === WebSocket.OPEN) try { upstream.send(data); } catch (_) {}
       else pending.push(data);
     });
