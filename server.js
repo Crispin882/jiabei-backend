@@ -434,7 +434,15 @@ if (WS_AVAILABLE) {
       if (current && current !== up) { try { current.close(); } catch (_) {} }
       current = up; upOpen = (up.readyState === 1); pending = [];
       up.on('open', () => { upOpen = true; while (pending.length) { try { up.send(pending.shift()); } catch (_) {} } });
-      up.on('message', (d) => { if (client.readyState === WebSocket.OPEN) try { client.send(d); } catch (_) {} });
+      up.on('message', (d) => {
+        if (client.readyState !== WebSocket.OPEN) return;
+        // DashScope 控制消息可能是 binary frame（内容仍是 JSON），必须转成字符串再转发，
+        // 否则浏览器按 Blob 收到后前端 JSON.parse 失败，task-started 被丢弃 → 实时识别永远连不上。
+        const text = (typeof d === 'string') ? d : (Buffer.isBuffer(d) ? d.toString('utf8') : (d && d.toString ? d.toString() : ''));
+        let evName = null; try { const j = JSON.parse(text); evName = j && j.header && j.header.event; } catch (_) {}
+        if (evName) console.log('[RT] 收到上游事件: ' + evName);
+        try { client.send(text); } catch (_) {}
+      });
       up.on('close', () => { /* 不联动关闭客户端，避免误杀；前端有超时兜底 */ });
       up.on('error', (e) => { console.error('[RT] 上游错误:', e && e.message || e); });
     }
