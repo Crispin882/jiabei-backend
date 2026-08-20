@@ -457,14 +457,31 @@ if (WS_AVAILABLE) {
     openUpstream();
 
     client.on('message', (data) => {
-      let action = null; try { const j = JSON.parse(data); action = j && j.header && j.header.action; } catch (_) {}
+      // 判定是否为 JSON 控制消息（run-task / finish-task）。
+      // 浏览器/反向代理可能把 JSON 控制消息以 binary 帧发来（ws.send(string) 经代理后常被改写为 binary 帧），
+      // 而 DashScope 要求 run-task/finish-task 必须是“文本(JSON)帧”，收到 binary 帧会静默忽略
+      // （表现为：握手成功、run-task 已送达，但 0 事件、最后优雅关闭）。故此处把控制消息归一化为文本帧转发。
+      let str = null;
+      if (typeof data === 'string') str = data;
+      else if (Buffer.isBuffer(data)) str = data.toString('utf8');
+      else if (typeof ArrayBuffer !== 'undefined' && data instanceof ArrayBuffer) str = new TextDecoder('utf-8').decode(data);
+      let isControl = false, action = null;
+      if (str) { try { const j = JSON.parse(str); if (j && j.header) { isControl = true; action = j.header.action; } } catch (_) {} }
       if (action === 'run-task') {
-        console.log('[RT] 收到客户端 run-task，转发到上游');
-        console.log('[RT] run-task 内容: ' + (typeof data === 'string' ? data.slice(0, 500) : '[binary]'));
+        console.log('[RT] 收到客户端 run-task，转发到上游（帧: ' + (typeof data === 'string' ? 'text' : 'binary→已转文本') + '）');
+        console.log('[RT] run-task 内容: ' + (str ? str.slice(0, 500) : '[空]'));
         if (upstream && upstream._watchdogArm) upstream._watchdogArm(6);
       }
-      if (upOpen && upstream && upstream.readyState === WebSocket.OPEN) try { upstream.send(data); } catch (_) {}
-      else pending.push(data);
+      if (isControl) {
+        // 关键修复：控制消息一律以文本帧转发给 DashScope
+        const out = (str != null) ? str : (typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data.toString('utf8') : ''));
+        if (upOpen && upstream && upstream.readyState === WebSocket.OPEN) try { upstream.send(out); } catch (_) {}
+        else pending.push(out);
+      } else {
+        // 二进制音频帧（Int16 PCM）：原样转发，保持字节不变
+        if (upOpen && upstream && upstream.readyState === WebSocket.OPEN) try { upstream.send(data); } catch (_) {}
+        else pending.push(data);
+      }
     });
     client.on('close', () => { try { if (upstream) upstream.close(); } catch (_) {} });
     client.on('error', () => {});
