@@ -1,0 +1,134 @@
+[
+  {
+    "id": "dd-greet-01",
+    "title": "打招呼",
+    "tag": "日常",
+    "lines": [
+      { "role": "我", "en": "Hello! How are you today?", "zh": "你好！你今天好吗？" },
+      { "role": "朋友", "en": "Hi! I am fine, thank you. And you?", "zh": "嗨！我很好，谢谢。你呢？" },
+      { "role": "我", "en": "I am great. Nice to see you.", "zh": "我很好。很高兴见到你。" },
+      { "role": "朋友", "en": "Nice to see you too. See you later!", "zh": "我也很高兴见到你。回头见！" }
+    ]
+  },
+  {
+    "id": "dd-school-01",
+    "title": "问同学名字",
+    "tag": "学校",
+    "lines": [
+      { "role": "我", "en": "Excuse me, what is your name?", "zh": "打扰一下，你叫什么名字？" },
+      { "role": "同学", "en": "My name is Lucy. What about you?", "zh": "我叫露西。你呢？" },
+      { "role": "我", "en": "I am Tom. Are you in Grade Three?", "zh": "我叫汤姆。你上三年级吗？" },
+      { "role": "同学", "en": "Yes, I am. We are in the same grade!", "zh": "是的。我们在同一年级！" }
+    ]
+  },
+  {
+    "id": "dd-shop-01",
+    "title": "买水果",
+    "tag": "购物",
+    "lines": [
+      { "role": "我", "en": "How much is the apple, please?", "zh": "请问苹果多少钱？" },
+      { "role": "店员", "en": "It is two yuan each.", "zh": "每个两元。" },
+      { "role": "我", "en": "I would like three apples, thank you.", "zh": "我要三个苹果，谢谢。" },
+      { "role": "店员", "en": "Here you are. Have a nice day!", "zh": "给你。祝你愉快！" }
+    ]
+  },
+  {
+    "id": "dd-food-01",
+    "title": "点餐",
+    "tag": "食物",
+    "lines": [
+      { "role": "我", "en": "What would you like to eat?", "zh": "你想吃点什么？" },
+      { "role": "朋友", "en": "I want some noodles and milk.", "zh": "我想吃面条，喝些牛奶。" },
+      { "role": "我", "en": "Good choice. I like noodles too.", "zh": "好选择。我也喜欢面条。" },
+      { "role": "朋友", "en": "Let us eat together.", "zh": "我们一起吃吧。" }
+    ]
+  },
+  {
+    "id": "dd-way-01",
+    "title": "问路",
+    "tag": "出行",
+    "lines": [
+      { "role": "我", "en": "Excuse me, where is the library?", "zh": "打扰一下，图书馆在哪里？" },
+      { "role": "路人", "en": "Go straight and turn left. It is next to the park.", "zh": "直走然后左转。它在公园旁边。" },
+      { "role": "我", "en": "Thank you very much!", "zh": "非常感谢！" },
+      { "role": "路人", "en": "You are welcome. Be careful on the road.", "zh": "不客气。路上小心。" }
+    ]
+  },
+  {
+    "id": "dd-weather-01",
+    "title": "聊天气",
+    "tag": "天气",
+    "lines": [
+      { "role": "我", "en": "What a sunny day! Do you like the sun?", "zh": "多晴朗的一天！你喜欢太阳吗？" },
+      { "role": "朋友", "en": "Yes, but I like snow more.", "zh": "喜欢，但我更喜欢雪。" },
+      { "role": "我", "en": "Really? We can make a snowman in winter.", "zh": "真的吗？冬天我们可以堆雪人。" },
+      { "role": "朋友", "en": "That sounds fun!", "zh": "听起来很有趣！" }
+    ]
+  },
+  {
+    "id": "dd-pet-01",
+    "title": "聊宠物",
+    "tag": "动物",
+    "lines": [
+      { "role": "我", "en": "Do you have a pet at home?", "zh": "你家里有宠物吗？" },
+      { "role": "朋友", "en": "Yes, I have a small cat.", "zh": "有，我有一只小猫咪。" },
+      { "role": "我", "en": "What is its name?", "zh": "它叫什么名字？" },
+      { "role": "朋友", "en": "Her name is Mimi. She is very cute.", "zh": "她叫咪咪。她非常可爱。" }
+    ]
+  },
+  {
+    "id": "dd-hobby-01",
+    "title": "聊爱好",
+    "tag": "兴趣",
+    "lines": [
+      { "role": "我", "en": "What do you like to do after school?", "zh": "放学后你喜欢做什么？" },
+      { "role": "朋友", "en": "I like reading books and drawing.", "zh": "我喜欢读书和画画。" },
+      { "role": "我", "en": "Me too! Drawing is my favorite.", "zh": "我也是！画画是我的最爱。" },
+      { "role": "朋友", "en": "We can draw together sometime.", "zh": "我们改天可以一起画。" }
+    ]
+  },
+  {
+    "id": "dd-birthday-01",
+    "title": "生日祝福",
+    "tag": "节日",
+    "lines": [
+      { "role": "我", "en": "Happy birthday to you!", "zh": "祝你生日快乐！" },
+      { "role": "朋友", "en": "Thank you! Would you like some cake?", "zh": "谢谢！你想吃点蛋糕吗？" },
+      { "role": "我", "en": "Yes, please. It looks delicious.", "zh": "好的，请给我。看起来很好吃。" },
+      { "role": "朋友", "en": "Here you are. Enjoy your party!", "zh": "给你。祝你派对愉快！" }
+    ]
+  },
+  {
+    "id": "dd-family-01",
+    "title": "介绍家人",
+    "tag": "家庭",
+    "lines": [
+      { "role": "我", "en": "How many people are there in your family?", "zh": "你家有几口人？" },
+      { "role": "朋友", "en": "Four. My dad, my mom, my sister and me.", "zh": "四口。爸爸、妈妈、姐姐和我。" },
+      { "role": "我", "en": "That is a happy family.", "zh": "那是个幸福的家庭。" },
+      { "role": "朋友", "en": "Yes, we love each other.", "zh": "是的，我们彼此相爱。" }
+    ]
+  },
+  {
+    "id": "dd-sport-01",
+    "title": "约运动",
+    "tag": "运动",
+    "lines": [
+      { "role": "我", "en": "Let us play basketball this weekend!", "zh": "我们这周末打篮球吧！" },
+      { "role": "朋友", "en": "Great idea! I like basketball.", "zh": "好主意！我喜欢篮球。" },
+      { "role": "我", "en": "We can meet at the school playground.", "zh": "我们可以在学校操场见面。" },
+      { "role": "朋友", "en": "OK, see you on Saturday.", "zh": "好的，周六见。" }
+    ]
+  },
+  {
+    "id": "dd-color-01",
+    "title": "说颜色",
+    "tag": "颜色",
+    "lines": [
+      { "role": "我", "en": "What is your favorite color?", "zh": "你最喜欢什么颜色？" },
+      { "role": "朋友", "en": "I like blue. The sky is blue.", "zh": "我喜欢蓝色。天空是蓝色的。" },
+      { "role": "我", "en": "I like green. Grass is green.", "zh": "我喜欢绿色。草是绿色的。" },
+      { "role": "朋友", "en": "Colors make the world beautiful.", "zh": "颜色让世界变得美丽。" }
+    ]
+  }
+]

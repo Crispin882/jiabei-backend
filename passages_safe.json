@@ -1,0 +1,112 @@
+[
+  {
+    "title": "My Red Cat",
+    "level": "入门",
+    "lines": [
+      "I have a small red cat.",
+      "Her name is Mimi.",
+      "She likes to sleep on my bed.",
+      "Every morning she says meow to me.",
+      "I love my little red cat."
+    ]
+  },
+  {
+    "title": "A Sunny Day",
+    "level": "入门",
+    "lines": [
+      "Today is a sunny day.",
+      "The sky is blue and the sun is warm.",
+      "I go to the park with my friend.",
+      "We run and laugh on the green grass.",
+      "We are very happy."
+    ]
+  },
+  {
+    "title": "My School",
+    "level": "初级",
+    "lines": [
+      "My school is big and clean.",
+      "There are many classrooms and a library.",
+      "My teacher is kind and patient.",
+      "I read books and make new friends at school.",
+      "I like going to school every day."
+    ]
+  },
+  {
+    "title": "The Little Dog",
+    "level": "初级",
+    "lines": [
+      "A little dog is lost in the street.",
+      "He looks sad and hungry.",
+      "A boy gives him some water and bread.",
+      "The dog wags his tail to say thank you.",
+      "Now they are good friends."
+    ]
+  },
+  {
+    "title": "Apple Tree",
+    "level": "初级",
+    "lines": [
+      "We plant a small apple tree in spring.",
+      "We water it when the sun is hot.",
+      "In autumn the tree has red apples.",
+      "My mother makes a sweet apple pie.",
+      "The whole family enjoys the pie together."
+    ]
+  },
+  {
+    "title": "My Family",
+    "level": "初级",
+    "lines": [
+      "There are four people in my family.",
+      "My father is a doctor and my mother is a teacher.",
+      "My sister and I go to the same school.",
+      "We eat dinner and talk about our day.",
+      "I feel warm and safe with my family."
+    ]
+  },
+  {
+    "title": "Rainy Morning",
+    "level": "中级",
+    "lines": [
+      "It is raining when I wake up in the morning.",
+      "The rain taps softly on the window.",
+      "I put on my yellow raincoat and boots.",
+      "On the way to school I see a small frog.",
+      "Rainy days can be quiet and beautiful too."
+    ]
+  },
+  {
+    "title": "The Helpful Robot",
+    "level": "中级",
+    "lines": [
+      "My uncle makes a small robot at home.",
+      "The robot can sweep the floor and sing songs.",
+      "It helps my grandma carry light things.",
+      "We teach it to say hello in English.",
+      "Technology can be a good friend to people."
+    ]
+  },
+  {
+    "title": "A Trip to the Zoo",
+    "level": "中级",
+    "lines": [
+      "Last Sunday our class visits the zoo.",
+      "We see tall giraffes and funny monkeys.",
+      "The panda eats bamboo slowly and looks cute.",
+      "Our teacher tells us to protect animals.",
+      "I learn a lot and want to come again."
+    ]
+  },
+  {
+    "title": "My Dream",
+    "level": "中级",
+    "lines": [
+      "When I grow up I want to be a pilot.",
+      "I will fly to many countries and see the world.",
+      "I will learn English well to talk with friends everywhere.",
+      "I will also help people who need a ride home.",
+      "I believe my dream can come true with hard work."
+    ]
+  }
+]
