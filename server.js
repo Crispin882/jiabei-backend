@@ -219,6 +219,79 @@ const audioStore = new Map(); // token -> { buf, ext, ts }
 function setAudio(token, buf, ext) { audioStore.set(token, { buf, ext, ts: Date.now() }); if (audioStore.size > 100) { const k = audioStore.keys().next().value; audioStore.delete(k); } }
 function getAudio(token) { const a = audioStore.get(token); if (a) audioStore.delete(token); return a; }
 
+/* ---------- 免费数据源薄代理（零成本 · 与付费 OCR/ASR 完全独立） ----------
+ * 仅代理免费、无需 Key 的公开数据源，用于「开口说」换一批/更多，不碰 DashScope、不花钱。
+ *  - GET /free-sentence ?q=主题词&offset=   → Tatoeba 英中双语例句（服务端缓存，失败回退空）
+ *  - GET /free-dialog   ?offset=            → 本地适龄对话子集随机抽（DailyDialog 风格自编）
+ *  - GET /free-passage  ?offset=            → 本地分级短文随机抽
+ * 前端约定：所有免费源请求都走与 OCR/ASR 相同的 cloudUrl（Render 后端），无需新增配置。
+ */
+const _freeCache = new Map(); // key -> { ts, data }
+const FREE_CACHE_TTL = 6 * 60 * 60 * 1000; // 6 小时
+function freeCacheGet(key) {
+  const c = _freeCache.get(key);
+  if (c && Date.now() - c.ts < FREE_CACHE_TTL) return c.data;
+  return null;
+}
+function freeCacheSet(key, data) {
+  _freeCache.set(key, { ts: Date.now(), data });
+  if (_freeCache.size > 300) { const k = _freeCache.keys().next().value; _freeCache.delete(k); }
+}
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+// Tatoeba 英中双语例句（搜索词 + 中文翻译）。浏览器直连 CORS 不稳，故经后端代理并缓存。
+async function fetchTatoeba(q, offset) {
+  const safeQ = String(q || '').trim().toLowerCase();
+  const url = 'https://api.tatoeba.org/v1/sentences/search?query=' + encodeURIComponent(safeQ) +
+    '&from=eng&to=cmn&has_translation=yes&trans_to=cmn&limit=20&offset=' + (parseInt(offset) || 0);
+  const r = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { 'Accept': 'application/json' } });
+  if (!r.ok) throw new Error('tatoeba http ' + r.status);
+  const j = await r.json();
+  const rows = (j && Array.isArray(j.results) ? j.results : []).map(function (it) {
+    return { en: (it.text || '').trim(), zh: ((it.translations && it.translations[0] && it.translations[0].text) || '').trim() };
+  }).filter(function (x) { return x.en && x.zh; });
+  return rows;
+}
+
+app.get('/free-sentence', async (req, res) => {
+  const q = String(req.query.q || '').slice(0, 40).trim();
+  const offset = parseInt(req.query.offset) || 0;
+  if (!q) return res.json({ ok: true, q: '', items: [], note: 'no-query' });
+  const key = 'sent:' + q + ':' + offset;
+  const cached = freeCacheGet(key);
+  if (cached) return res.json({ ok: true, q: q, items: cached, cached: true });
+  try {
+    const items = await fetchTatoeba(q, offset);
+    freeCacheSet(key, items);
+    res.json({ ok: true, q: q, items: items });
+  } catch (e) {
+    // 代理失败不致命：返回空，前端回退到离线精选集
+    res.json({ ok: false, q: q, items: [], error: (e && e.message || String(e)) });
+  }
+});
+
+// 本地适龄对话 / 短文子集（与前端 assets/data 同源思路，但放在后端便于“换一批”随机且离线）
+let _ddSafe = null, _pgSafe = null;
+try { _ddSafe = require('./dailydialog_safe.json'); } catch (e) { _ddSafe = []; }
+try { _pgSafe = require('./passages_safe.json'); } catch (e) { _pgSafe = []; }
+
+app.get('/free-dialog', (req, res) => {
+  const offset = parseInt(req.query.offset) || 0;
+  const pool = shuffle(_ddSafe || []);
+  const pick = pool.slice(offset % Math.max(pool.length, 1), (offset % Math.max(pool.length, 1)) + 6);
+  res.json({ ok: true, items: pick.length ? pick : (pool.slice(0, 6)) });
+});
+
+app.get('/free-passage', (req, res) => {
+  const offset = parseInt(req.query.offset) || 0;
+  const pool = shuffle(_pgSafe || []);
+  const pick = pool.slice(offset % Math.max(pool.length, 1), (offset % Math.max(pool.length, 1)) + 4);
+  res.json({ ok: true, items: pick.length ? pick : (pool.slice(0, 4)) });
+});
+
 /* ---------- 路由 ---------- */
 /* 诊断接口：返回 API Key 脱敏元信息，不暴露完整 Key，用于排查「Incorrect API key」 */
 app.get('/diag', (req, res) => {
