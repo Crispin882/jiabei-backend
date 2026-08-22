@@ -249,6 +249,27 @@ function shuffle(arr) {
 //  - sort=random 增加多样；trans:lang=cmn 只返回带中文翻译的句子
 // 响应结构：{ data:[ { text:"英文", translations:[ { text:"中文", lang:"cmn" } ] } ] }
 const _BAD_WORDS = /(sex|porn|drug|kill|die|dead|blood|war|fuck|shit|ass|bitch|hell|damn|wtf|rape|weed|alcohol|drunk|smoke|gun|murder|naked|nude|breast|penis|vagina|condom|pregnant|abortion|suicide|stupid|idiot)/i;
+
+// 繁→简转换：Tatoeba 返回的中文翻译是繁体，孩子/家长更习惯简体，故服务端统一转简体。
+// opencc-js 为纯 JS、零成本；若未安装则跳过转换（不影响主流程，仅显示繁体，绝不让进程崩溃）。
+let _toSimp = null, _convInit = false;
+function toSimplified(text) {
+  if (!text) return text;
+  if (!_convInit) {
+    _convInit = true;
+    try {
+      const OpenCC = require('opencc-js');
+      _toSimp = OpenCC.Converter({ from: 'tw', to: 'cn' });
+      console.log('[加贝] opencc-js 已加载，Tatoeba 繁体中文将自动转简体。');
+    } catch (e) {
+      console.warn('[WARN] 未检测到 opencc-js，Tatoeba 繁体中文将不转简体。如需简体，请执行 `npm install opencc-js` 后重新部署。');
+      _toSimp = null;
+    }
+  }
+  if (_toSimp) { try { return _toSimp(text); } catch (e) { return text; } }
+  return text;
+}
+
 async function fetchTatoeba(q, limit) {
   const safeQ = String(q || '').trim().toLowerCase();
   if (!safeQ) return [];
@@ -258,8 +279,8 @@ async function fetchTatoeba(q, limit) {
   if (!r.ok) throw new Error('tatoeba http ' + r.status);
   const j = await r.json();
   const rows = (j && Array.isArray(j.data) ? j.data : []).map(function (it) {
-    const zh = (it.translations && it.translations[0] && it.translations[0].text) || '';
-    return { en: (it.text || '').trim(), zh: zh.trim() };
+    const zhRaw = (it.translations && it.translations[0] && it.translations[0].text) || '';
+    return { en: (it.text || '').trim(), zh: toSimplified(zhRaw.trim()) };
   }).filter(function (x) {
     // 只保留：含目标词、有中文翻译、不含不良词（给孩子用的轻量把关）
     return x.en && x.zh && x.en.toLowerCase().includes(safeQ) && !_BAD_WORDS.test(x.en);
