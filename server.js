@@ -256,6 +256,41 @@ async function fetchTatoeba(q, offset) {
   return rows;
 }
 
+// 服务端代理 Free Dictionary API：为「主题词库」稳定补全音标/例句/词性（国内可达、零成本）。
+// 浏览器直连 dictionaryapi.dev 在国外/家庭网络常超时（表现为“离线”），故改由后端代理并缓存。
+async function fetchDictApi(word) {
+  const w = String(word || '').trim().toLowerCase();
+  const url = 'https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(w);
+  const r = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { 'Accept': 'application/json' } });
+  if (!r.ok) throw new Error('dict http ' + r.status);
+  const d = await r.json();
+  if (!Array.isArray(d) || !d[0] || d[0].title) throw new Error('dict notfound');
+  const ent = d[0];
+  let phonetic = ent.phonetic || '';
+  if (!phonetic) (ent.phonetics || []).forEach(function (ph) { if (!phonetic && ph.text) phonetic = ph.text; });
+  let pos = '', example = '';
+  (ent.meanings || []).forEach(function (m) {
+    if (!pos) pos = m.partOfSpeech || '';
+    (m.definitions || []).forEach(function (df) { if (!example && df.example) example = df.example; });
+  });
+  return { word: ent.word || w, phonetic: phonetic, pos: pos, example: example };
+}
+app.get('/free-word', async (req, res) => {
+  const w = String(req.query.w || '').slice(0, 40).trim();
+  if (!w) return res.json({ ok: true, w: '', phonetic: '', pos: '', example: '' });
+  const key = 'word:' + w;
+  const cached = freeCacheGet(key);
+  if (cached) return res.json(Object.assign({ ok: true, w: w, cached: true }, cached));
+  try {
+    const d = await fetchDictApi(w);
+    freeCacheSet(key, d);
+    res.json(Object.assign({ ok: true, w: w }, d));
+  } catch (e) {
+    // 代理失败不致命：返回空，前端回退到“仅中文释义”并提示手动填写
+    res.json({ ok: false, w: w, phonetic: '', pos: '', example: '', error: (e && e.message || String(e)) });
+  }
+});
+
 app.get('/free-sentence', async (req, res) => {
   const q = String(req.query.q || '').slice(0, 40).trim();
   const offset = parseInt(req.query.offset) || 0;
