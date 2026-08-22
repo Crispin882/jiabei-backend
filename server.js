@@ -290,7 +290,7 @@ async function fetchTatoeba(q, limit) {
 
 // 服务端代理 Free Dictionary API：为「主题词库」稳定补全音标/例句/词性（国内可达、零成本）。
 // 浏览器直连 dictionaryapi.dev 在国外/家庭网络常超时（表现为“离线”），故改由后端代理并缓存。
-async function fetchDictApi(word) {
+async function fetchDictApi(word, acc) {
   const w = String(word || '').trim().toLowerCase();
   const url = 'https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(w);
   const r = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { 'Accept': 'application/json' } });
@@ -299,13 +299,24 @@ async function fetchDictApi(word) {
   if (!Array.isArray(d) || !d[0] || d[0].title) throw new Error('dict notfound');
   // dictionaryapi.dev 返回同一词的多个词条版本（数组），音标/例句常分布在后面版本，
   // 需全量遍历所有版本取第一个非空字段，否则像 cat 这类主词条首义无例句会返回空。
-  let wordOut = '', phonetic = '', pos = '', example = '';
+  // 同时：该源的「顶层 phonetic」与「phonetics[0].text」默认是英式（英式 RP），
+  // 美式音标藏在 audio 链接含 -us 的 phonetics 条目里。按用户口音优先选对应音标。
+  let wordOut = '', phonetic = '', phoneticUS = '', phoneticUK = '', pos = '', example = '';
+  const a = (acc || 'en-US').toLowerCase();
+  const wantUS = a.indexOf('us') >= 0;
+  const wantUK = a.indexOf('gb') >= 0;
   for (const ent of d) {
     if (!wordOut && ent.word) wordOut = ent.word;
     if (!phonetic) {
       if (ent.phonetic) phonetic = ent.phonetic;
       else (ent.phonetics || []).forEach(function (ph) { if (!phonetic && ph.text) phonetic = ph.text; });
     }
+    (ent.phonetics || []).forEach(function (ph) {
+      if (!ph.text) return;
+      const audio = (ph.audio || '').toLowerCase();
+      if (!phoneticUS && /(^|[-_])(us|american)/.test(audio)) phoneticUS = ph.text;
+      if (!phoneticUK && /(^|[-_])(uk|gb|british)/.test(audio)) phoneticUK = ph.text;
+    });
     for (const m of (ent.meanings || [])) {
       if (!pos) pos = m.partOfSpeech || '';
       for (const df of (m.definitions || [])) {
@@ -314,16 +325,21 @@ async function fetchDictApi(word) {
     }
     if (phonetic && pos && example) break; // 三个字段都拿到就提前结束
   }
-  return { word: wordOut || w, phonetic: phonetic, pos: pos, example: example };
+  // 按口音选音标：美式优先用含 -us 的音标，英式优先用含 -uk/-gb 的；取不到则回退默认（英式）
+  let chosen = phonetic;
+  if (wantUS && phoneticUS) chosen = phoneticUS;
+  else if (wantUK && phoneticUK) chosen = phoneticUK;
+  return { word: wordOut || w, phonetic: chosen, phoneticUS: phoneticUS, phoneticUK: phoneticUK, pos: pos, example: example };
 }
 app.get('/free-word', async (req, res) => {
   const w = String(req.query.w || '').slice(0, 40).trim();
+  const acc = String(req.query.acc || 'en-US').slice(0, 8).trim() || 'en-US';
   if (!w) return res.json({ ok: true, w: '', phonetic: '', pos: '', example: '' });
-  const key = 'word:v2:' + w;
+  const key = 'word:v3:' + acc + ':' + w;
   const cached = freeCacheGet(key);
   if (cached) return res.json(Object.assign({ ok: true, w: w, cached: true }, cached));
   try {
-    const d = await fetchDictApi(w);
+    const d = await fetchDictApi(w, acc);
     freeCacheSet(key, d);
     res.json(Object.assign({ ok: true, w: w }, d));
   } catch (e) {
