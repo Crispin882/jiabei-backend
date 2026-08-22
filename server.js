@@ -265,20 +265,29 @@ async function fetchDictApi(word) {
   if (!r.ok) throw new Error('dict http ' + r.status);
   const d = await r.json();
   if (!Array.isArray(d) || !d[0] || d[0].title) throw new Error('dict notfound');
-  const ent = d[0];
-  let phonetic = ent.phonetic || '';
-  if (!phonetic) (ent.phonetics || []).forEach(function (ph) { if (!phonetic && ph.text) phonetic = ph.text; });
-  let pos = '', example = '';
-  (ent.meanings || []).forEach(function (m) {
-    if (!pos) pos = m.partOfSpeech || '';
-    (m.definitions || []).forEach(function (df) { if (!example && df.example) example = df.example; });
-  });
-  return { word: ent.word || w, phonetic: phonetic, pos: pos, example: example };
+  // dictionaryapi.dev 返回同一词的多个词条版本（数组），音标/例句常分布在后面版本，
+  // 需全量遍历所有版本取第一个非空字段，否则像 cat 这类主词条首义无例句会返回空。
+  let wordOut = '', phonetic = '', pos = '', example = '';
+  for (const ent of d) {
+    if (!wordOut && ent.word) wordOut = ent.word;
+    if (!phonetic) {
+      if (ent.phonetic) phonetic = ent.phonetic;
+      else (ent.phonetics || []).forEach(function (ph) { if (!phonetic && ph.text) phonetic = ph.text; });
+    }
+    for (const m of (ent.meanings || [])) {
+      if (!pos) pos = m.partOfSpeech || '';
+      for (const df of (m.definitions || [])) {
+        if (!example && df.example) example = df.example;
+      }
+    }
+    if (phonetic && pos && example) break; // 三个字段都拿到就提前结束
+  }
+  return { word: wordOut || w, phonetic: phonetic, pos: pos, example: example };
 }
 app.get('/free-word', async (req, res) => {
   const w = String(req.query.w || '').slice(0, 40).trim();
   if (!w) return res.json({ ok: true, w: '', phonetic: '', pos: '', example: '' });
-  const key = 'word:' + w;
+  const key = 'word:v2:' + w;
   const cached = freeCacheGet(key);
   if (cached) return res.json(Object.assign({ ok: true, w: w, cached: true }, cached));
   try {
