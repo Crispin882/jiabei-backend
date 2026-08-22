@@ -490,6 +490,39 @@ app.get('/asr/status/:id', (req, res) => {
   res.json(t);
 });
 
+/* ---------- AI 口语陪练：文本对话模型（qwen-turbo 等）----------
+ * 新增长连接「和 AI 用英语聊天」：前端维护多轮 messages 发来，后端调文本对话模型接话。
+ * 半引导 + 小学词为主偶尔初中词 + 美式 + 自信保护，prompt 由前端在 messages[0] 固化传入。
+ * 单模型阶段只用 CHAT_MODEL（默认 qwen-turbo）；下一步可扩成模型池自动降级（见 chatQwen 注释）。
+ */
+const CHAT_MODEL = process.env.CHAT_MODEL || 'qwen-turbo';
+
+async function chatQwen(messages) {
+  // 单模型阶段：直接调 CHAT_MODEL。
+  // 后续扩模型池时：把这里换成「按 CHAT_MODELS 顺序尝试，遇 quota_exceeded 跳下一个」即可，调用方式不变。
+  const url = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
+  const body = {
+    model: CHAT_MODEL,
+    messages: messages,
+    temperature: 0.8,
+    max_tokens: 220 // 控制 AI 回复长度（1–3 句短回复，适合 TTS 朗读、孩子模仿语调）
+  };
+  const r = await fetch(url, {
+    method: 'POST',
+    signal: AbortSignal.timeout(30000),
+    headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const j = await r.json().catch(() => ({}));
+  if (j.error) {
+    const c = j.error.code || '';
+    // 后续可在前端识别 quota 类错误做降级提示；当前直接抛错由路由兜底
+    throw new Error(`云端对话失败[${c}]：${j.error.message || JSON.stringify(j.error)}`);
+  }
+  const content = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
+  return content.trim();
+}
+
 /* ---------- 整句 TTS：复用 DashScope key，合成整句英文（有道 dictvoice 不支持整句）---------- */
 app.get('/tts', async (req, res) => {
   if (!API_KEY) return res.status(400).json({ error: 'no-key', message: '未配置 API_KEY，无法使用云端整句发音（请在 .env 配置 DashScope key，并已开通“语音合成”）' });
@@ -534,6 +567,29 @@ app.get('/tts', async (req, res) => {
     throw new Error('云端 TTS 未返回音频：' + JSON.stringify(j).slice(0, 200));
   } catch (e) {
     res.status(502).json({ error: 'tts-failed', message: e.message || String(e) });
+  }
+});
+
+/* ---------- AI 口语陪练：对话端点 ---------- */
+app.post('/chat', express.json({ limit: '60kb' }), async (req, res) => {
+  // 无 key 时直接告知，避免前端静默失败
+  if (!API_KEY) return res.status(400).json({ error: 'no-key', message: '未配置 API_KEY，无法使用 AI 聊天（请在 .env 配置 DashScope key）' });
+  // messages：前端传入完整多轮对话（含 system prompt 作 messages[0]），后端只透传给模型。
+  // 这样 prompt 的迭代/调参完全在前端控制，后端保持薄代理。
+  const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+  if (!messages.length) return res.status(400).json({ error: 'empty', message: 'messages 为空' });
+  // 轻量把关：限制角色与条数，避免异常输入
+  const clean = messages.slice(-40).map(m => ({
+    role: (m.role === 'system' || m.role === 'user' || m.role === 'assistant') ? m.role : 'user',
+    content: String(m.content || '').slice(0, 2000)
+  })).filter(m => m.content);
+  if (!clean.length) return res.status(400).json({ error: 'empty', message: '有效消息为空' });
+  try {
+    const reply = await chatQwen(clean);
+    if (!reply) return res.status(502).json({ error: 'empty-reply', message: 'AI 未返回内容，请重试' });
+    res.json({ ok: true, reply: reply, model: CHAT_MODEL });
+  } catch (e) {
+    res.status(502).json({ error: 'chat-failed', message: e.message || String(e) });
   }
 });
 
