@@ -221,7 +221,7 @@ function getAudio(token) { const a = audioStore.get(token); if (a) audioStore.de
 
 /* ---------- 免费数据源薄代理（零成本 · 与付费 OCR/ASR 完全独立） ----------
  * 仅代理免费、无需 Key 的公开数据源，用于「开口说」换一批/更多，不碰 DashScope、不花钱。
- *  - GET /free-sentence ?q=主题词&offset=   → Tatoeba 英中双语例句（服务端缓存，失败回退空）
+ *  - GET /free-sentence ?q=主题词&limit=    → Tatoeba 英中双语例句（真实母语句子+人工中文，服务端缓存，失败回退空）
  *  - GET /free-dialog   ?offset=            → 本地适龄对话子集随机抽（DailyDialog 风格自编）
  *  - GET /free-passage  ?offset=            → 本地分级短文随机抽
  * 前端约定：所有免费源请求都走与 OCR/ASR 相同的 cloudUrl（Render 后端），无需新增配置。
@@ -242,17 +242,28 @@ function shuffle(arr) {
   for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
   return a;
 }
-// Tatoeba 英中双语例句（搜索词 + 中文翻译）。浏览器直连 CORS 不稳，故经后端代理并缓存。
-async function fetchTatoeba(q, offset) {
+// Tatoeba 英中双语例句（真实母语者句子 + 人工中文翻译，权威、适龄、免费、CC-BY）。
+// 浏览器直连 CORS 不稳且国内常不可达，故经后端代理并缓存。
+// 当前 API：GET /v1/sentences?lang=eng&q="词"&trans:lang=cmn&word_count=3-9&sort=random
+//  - q 用双引号包裹 = 精确包含该词；word_count=3-9 只取短句（更适合孩子跟读）
+//  - sort=random 增加多样；trans:lang=cmn 只返回带中文翻译的句子
+// 响应结构：{ data:[ { text:"英文", translations:[ { text:"中文", lang:"cmn" } ] } ] }
+const _BAD_WORDS = /(sex|porn|drug|kill|die|dead|blood|war|fuck|shit|ass|bitch|hell|damn|wtf|rape|weed|alcohol|drunk|smoke|gun|murder|naked|nude|breast|penis|vagina|condom|pregnant|abortion|suicide|stupid|idiot)/i;
+async function fetchTatoeba(q, limit) {
   const safeQ = String(q || '').trim().toLowerCase();
-  const url = 'https://api.tatoeba.org/v1/sentences/search?query=' + encodeURIComponent(safeQ) +
-    '&from=eng&to=cmn&has_translation=yes&trans_to=cmn&limit=20&offset=' + (parseInt(offset) || 0);
+  if (!safeQ) return [];
+  const url = 'https://api.tatoeba.org/v1/sentences?lang=eng&q=' + encodeURIComponent('"' + safeQ + '"') +
+    '&trans:lang=cmn&word_count=3-9&sort=random&limit=' + (parseInt(limit) || 8);
   const r = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { 'Accept': 'application/json' } });
   if (!r.ok) throw new Error('tatoeba http ' + r.status);
   const j = await r.json();
-  const rows = (j && Array.isArray(j.results) ? j.results : []).map(function (it) {
-    return { en: (it.text || '').trim(), zh: ((it.translations && it.translations[0] && it.translations[0].text) || '').trim() };
-  }).filter(function (x) { return x.en && x.zh; });
+  const rows = (j && Array.isArray(j.data) ? j.data : []).map(function (it) {
+    const zh = (it.translations && it.translations[0] && it.translations[0].text) || '';
+    return { en: (it.text || '').trim(), zh: zh.trim() };
+  }).filter(function (x) {
+    // 只保留：含目标词、有中文翻译、不含不良词（给孩子用的轻量把关）
+    return x.en && x.zh && x.en.toLowerCase().includes(safeQ) && !_BAD_WORDS.test(x.en);
+  });
   return rows;
 }
 
@@ -302,13 +313,13 @@ app.get('/free-word', async (req, res) => {
 
 app.get('/free-sentence', async (req, res) => {
   const q = String(req.query.q || '').slice(0, 40).trim();
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = parseInt(req.query.limit) || 8;
   if (!q) return res.json({ ok: true, q: '', items: [], note: 'no-query' });
-  const key = 'sent:' + q + ':' + offset;
+  const key = 'sent:' + q.toLowerCase();
   const cached = freeCacheGet(key);
   if (cached) return res.json({ ok: true, q: q, items: cached, cached: true });
   try {
-    const items = await fetchTatoeba(q, offset);
+    const items = await fetchTatoeba(q, limit);
     freeCacheSet(key, items);
     res.json({ ok: true, q: q, items: items });
   } catch (e) {
