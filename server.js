@@ -525,8 +525,11 @@ async function chatQwen(messages, tried) {
   const body = {
     model: model,
     messages: messages,
-    temperature: 0.8,
-    max_tokens: 220 // 控制 AI 回复长度（1–3 句短回复，适合 TTS 朗读、孩子模仿语调）
+    temperature: 0.7,
+    max_tokens: 160, // 控制 AI 回复长度（1 句短回复，适合 TTS 朗读、孩子模仿语调）
+    stream: false,
+    // qwen3.6-flash 默认会走 thinking，首 token 慢；关闭思考可大幅加速短对话
+    extra_body: { enable_thinking: false }
   };
   let r;
   try {
