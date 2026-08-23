@@ -527,7 +527,7 @@ async function chatQwen(messages, tried) {
     messages: messages,
     temperature: 0.7,
     max_tokens: 160, // 控制 AI 回复长度（1 句短回复，适合 TTS 朗读、孩子模仿语调）
-    stream: false,
+    stream: true, // 流式输出：首 token 极快，前端边收边朗读，消除"整段等"
     // qwen3.6-flash 默认会走 thinking，首 token 慢；关闭思考可大幅加速短对话
     extra_body: { enable_thinking: false }
   };
@@ -544,6 +544,17 @@ async function chatQwen(messages, tried) {
     tried.push(model);
     return chatQwen(messages, tried);
   }
+  const ct = r.headers.get('content-type') || '';
+  // 流式：server-sent-events；非流式（个别模型不支持 stream）：普通 JSON
+  if (ct.includes('text/event-stream') || ct.includes('stream')) {
+    const out = await consumeStream(r, model);
+    if (!out.sawChunk) {
+      // 流式但一点内容都没收到，视为该模型异常 → 试下一个
+      tried.push(model);
+      return chatQwen(messages, tried);
+    }
+    return out;
+  }
   const j = await r.json().catch(() => ({}));
   if (j.error) {
     const code = j.error.code || (j.error.type) || '';
@@ -558,6 +569,35 @@ async function chatQwen(messages, tried) {
   }
   const content = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
   return { text: content.trim(), model: model };
+}
+
+// 解析流式 SSE 响应，逐块累积文本；出错或缺块时返回已累积内容（保证可用性优于彻底失败）
+async function consumeStream(r, model){
+  const reader = r.body.getReader();
+  const dec = new TextDecoder('utf-8');
+  let buf = '', text = '', sawChunk = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    // SSE 以 "\n\n" 分段，每段 "data: {...}"
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const p = JSON.parse(data);
+          const d = p.choices && p.choices[ 0 ] && p.choices[ 0 ].delta && p.choices[ 0 ].delta.content;
+          if (d) { text += d; sawChunk = true; }
+        } catch (e) { /* 跳过无法解析的探测行 */ }
+      }
+    }
+  }
+  return { text: text.trim(), model, sawChunk };
 }
 
 /* ---------- 整句 TTS：复用 DashScope key，合成整句英文（有道 dictvoice 不支持整句）---------- */
