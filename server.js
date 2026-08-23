@@ -14,6 +14,7 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
 const http = require('http');
 // 实时语音识别依赖 ws；若未安装，主服务仍正常启动，仅 /asr-realtime 不可用（避免整个进程崩溃导致部署失败）
 let WebSocketServer = null, WebSocket = null, WS_AVAILABLE = false;
@@ -568,7 +569,7 @@ async function chatQwen(messages, tried) {
     throw new Error(`云端对话失败[${code}]：${msg}`);
   }
   const content = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
-  return { text: content.trim(), model: model };
+  return { text: content.trim(), model: model, usage: j.usage || null };
 }
 
 // 解析流式 SSE 响应，逐块累积文本；出错或缺块时返回已累积内容（保证可用性优于彻底失败）
@@ -576,6 +577,7 @@ async function consumeStream(r, model){
   const reader = r.body.getReader();
   const dec = new TextDecoder('utf-8');
   let buf = '', text = '', sawChunk = false;
+  let usage = null;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -593,11 +595,14 @@ async function consumeStream(r, model){
           const p = JSON.parse(data);
           const d = p.choices && p.choices[ 0 ] && p.choices[ 0 ].delta && p.choices[ 0 ].delta.content;
           if (d) { text += d; sawChunk = true; }
+          // 计费用量：部分模型在末尾 data 行带 usage（也有放在 choices[0].usage）
+          if (p.usage) usage = p.usage;
+          else if (p.choices && p.choices[0] && p.choices[0].usage) usage = p.choices[0].usage;
         } catch (e) { /* 跳过无法解析的探测行 */ }
       }
     }
   }
-  return { text: text.trim(), model, sawChunk };
+  return { text: text.trim(), model, sawChunk, usage };
 }
 
 /* ---------- 整句 TTS：复用 DashScope key，合成整句英文（有道 dictvoice 不支持整句）---------- */
@@ -647,6 +652,41 @@ app.get('/tts', async (req, res) => {
   }
 });
 
+/* ---------- 模型池用量统计（叠加免费额度看板） ----------
+ * 百炼免费额度按模型各自发放，后端薄代理按 CHAT_MODELS 顺序自动降级。
+ * 这里累计每个模型当月已用 tokens，并落盘 usage.json（Render 重启会重置到部署快照，但至少展示实时累计）。
+ * 同时记录每轮练习计数，供「预计还能练几天」估算。
+ */
+const USAGE_FILE = path.join(__dirname, 'usage.json');
+let usageCache = null; // { monthKey, perModel:{ [model]:{prompt, completion, total, calls} }, rounds }
+function loadUsage(){
+  if (usageCache) return usageCache;
+  try { usageCache = JSON.parse(fs.readFileSync(USAGE_FILE, 'utf-8')); }
+  catch (_) { usageCache = null; }
+  const mk = new Date().toISOString().slice(0, 7); // YYYY-MM
+  if (!usageCache || usageCache.monthKey !== mk) {
+    usageCache = { monthKey: mk, perModel: {}, rounds: 0 };
+  }
+  return usageCache;
+}
+function saveUsage(){
+  try { fs.writeFileSync(USAGE_FILE, JSON.stringify(usageCache), 'utf-8'); } catch (_) {}
+}
+function recordUsage(model, usage, rounded){
+  const u = loadUsage();
+  const m = u.perModel[model] || { prompt: 0, completion: 0, total: 0, calls: 0 };
+  const p = (usage && (usage.prompt_tokens || usage.input_tokens)) || 0;
+  const c = (usage && (usage.completion_tokens || usage.output_tokens)) || 0;
+  const t = (usage && usage.total_tokens) || (p + c);
+  m.prompt += Number(p) || 0;
+  m.completion += Number(c) || 0;
+  m.total += Number(t) || 0;
+  m.calls += 1;
+  u.perModel[model] = m;
+  if (rounded) u.rounds += 1; // 仅在有真实对话轮次时计数
+  saveUsage();
+}
+
 /* ---------- AI 口语陪练：对话端点 ---------- */
 app.post('/chat', express.json({ limit: '60kb' }), async (req, res) => {
   // 无 key 时直接告知，避免前端静默失败
@@ -664,10 +704,44 @@ app.post('/chat', express.json({ limit: '60kb' }), async (req, res) => {
   try {
     const out = await chatQwen(clean);
     if (!out || !out.text) return res.status(502).json({ error: 'empty-reply', message: 'AI 未返回内容，请重试' });
-    res.json({ ok: true, reply: out.text, model: out.model });
+    try { recordUsage(out.model, out.usage, true); } catch (_) {}
+    res.json({ ok: true,  reply: out.text, model: out.model });
   } catch (e) {
     res.status(502).json({ error: 'chat-failed', message: e.message || String(e) });
   }
+});
+
+/* 用量看板：各模型本月已用 tokens、状态、预计还能练几天 */
+app.get('/chat-usage', (req, res) => {
+  const u = loadUsage();
+  // 单模型免费额度保守估算（百炼 flash 系列通常每月数百万 tokens，这里取保守 1,000,000）
+  const FREE_PER_MODEL = Number(process.env.CHAT_FREE_QUOTA) || 1000000;
+  const models = CHAT_MODELS.map(m => {
+    const s = u.perModel[m] || { prompt: 0, completion: 0, total: 0, calls: 0 };
+    const used = s.total || 0;
+    const remain = Math.max(0, FREE_PER_MODEL - used);
+    // 按近况估算每天消耗：若有数据，用（已用/已过天数）做保守线性外推；否则给兜底预估
+    const dayOfMonth = new Date().getDate();
+    const daysLeft = Math.max(1, new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate() - dayOfMonth + 1);
+    let perDay = 0;
+    if (s.total > 0 && dayOfMonth > 0) perDay = s.total / dayOfMonth;
+    const canDays = perDay > 0 ? Math.floor(remain / perDay) : 9999;
+    return {
+      model: m,
+      used: used,
+      remain: remain,
+      calls: s.calls || 0,
+      status: used >= FREE_PER_MODEL ? 'exhausted' : 'ok',
+      canDays: canDays > 365 ? '>1年' : (canDays + ' 天')
+    };
+  });
+  res.json({
+    month: u.monthKey,
+    rounds: u.rounds || 0,
+    freePerModel: FREE_PER_MODEL,
+    models: models,
+    note: '百炼免费额度按模型发放，后端自动降级；表中为保守估算，实际以官方为准。'
+  });
 });
 
 app.get('/', (req, res) => {
