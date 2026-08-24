@@ -652,6 +652,111 @@ app.get('/tts', async (req, res) => {
   }
 });
 
+/* ---------- 免费 Edge TTS（零 key · 纯正美式 neural 音色 · 各设备一致） ----------
+ * 复用 Microsoft Edge 在线 TTS（与 Edge 浏览器“大声朗读”同源），无需任何 API Key、零成本。
+ * 通过 WebSocket 直连 speech.platform.bing.com，带 Sec-MS-GEC 时间戳签名（版本跟随当前 Edge）。
+ * 前端“整句朗读/听”优先走此端点；华为/安卓本机 speechSynthesis 常静音，此方案用 <audio> 播放 MP3，全设备可用。
+ * 注意：TRUSTED_CLIENT_TOKEN 与 GEC 算法均来自公开 edge-tts 项目，仅作免费语音合成用途。
+ */
+const EDGE_TRUSTED = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
+const EDGE_GEC_VERSION = '1-143.0.3650.75';
+const EDGE_CHROME = '143';
+
+function edgeSecMsGec() {
+  let ticks = Math.floor(Date.now() / 1000);
+  ticks += 11644473600;            // Windows 纪元(1601)偏移
+  ticks -= ticks % 300;            // 向下取整到 5 分钟窗口（与服务端对齐）
+  ticks *= 10000000;               // 100 纳秒间隔
+  return crypto.createHash('sha256').update(String(ticks) + EDGE_TRUSTED).digest('hex').toUpperCase();
+}
+function edgeDateStr() {
+  const d = new Date();
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const mos = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const p = n => String(n).padStart(2, '0');
+  return `${days[d.getUTCDay()]} ${mos[d.getUTCMonth()]} ${p(d.getUTCDate())} ${d.getUTCFullYear()} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} GMT+0000 (Coordinated Universal Time)`;
+}
+const _edgeVoiceRe = /^[a-z]{2}-[A-Z]{2}-[A-Za-z]+(Neural|Class)$/;
+
+function edgeTTS(text, voice) {
+  return new Promise((resolve, reject) => {
+    const uid = () => crypto.randomUUID().replace(/-/g, '');
+    const safe = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const url = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${EDGE_TRUSTED}&ConnectionId=${uid()}&Sec-MS-GEC=${edgeSecMsGec()}&Sec-MS-GEC-Version=${EDGE_GEC_VERSION}`;
+    const ws = new WebSocket(url, {
+      headers: {
+        'Pragma': 'no-cache',
+        'Cache-Control': 'no-cache',
+        'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
+        'User-Agent': `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${EDGE_CHROME}.0.0.0 Safari/537.36 Edg/${EDGE_CHROME}.0.0.0`,
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cookie': `muid=${crypto.randomBytes(16).toString('hex').toUpperCase()};`
+      }
+    });
+    const audio = [];
+    let settled = false; let _msgN = 0, _binN = 0;
+    const done = (err, buf) => {
+      if (settled) return; settled = true;
+      console.error('[EDGE] done err=' + (err && err.message) + ' audioBytes=' + (buf ? buf.length : 0) + ' msgs=' + _msgN + ' bins=' + _binN);
+      clearTimeout(timer);
+      try { ws.close(); } catch (_) {}
+      if (err) reject(err); else resolve(buf);
+    };
+    const timer = setTimeout(() => done(new Error('Edge TTS 超时')), 30000);
+    ws.on('error', e => done(e));
+    ws.on('message', (raw, isBinary) => {
+      if (!isBinary) {
+        _msgN++;
+        const s = raw.toString('utf8');
+        if (s.includes('turn.end')) done(null, Buffer.concat(audio));
+        return;
+      }
+      _binN++;
+      const sep = 'Path:audio\r\n';
+      const i = raw.indexOf(sep);
+      if (i >= 0) audio.push(raw.subarray(i + sep.length));
+      else console.error('[EDGE] bin frame without Path:audio, len=' + raw.length);
+    });
+    ws.on('open', () => {
+      const cfg = `X-Timestamp:${edgeDateStr()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n`;
+      ws.send(cfg, { compress: true }, (e) => {
+        if (e) return done(e);
+        const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='${voice}'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>${safe}</prosody></voice></speak>`;
+        const msg = `X-RequestId:${uid()}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${edgeDateStr()}Z\r\nPath:ssml\r\n\r\n${ssml}`;
+        ws.send(msg, { compress: true }, (e2) => { if (e2) done(e2); });
+      });
+    });
+  });
+}
+
+/* 免费 Edge TTS 端点（零 key）。前端整句朗读/听优先调用此端点。 */
+const _edgeRate = new Map(); // ip -> [timestamps]
+function edgeRateOk(ip) {
+  const now = Date.now();
+  const arr = (_edgeRate.get(ip) || []).filter(t => now - t < 60000);
+  if (arr.length >= 60) { _edgeRate.set(ip, arr); return false; }
+  arr.push(now); _edgeRate.set(ip, arr); return true;
+}
+app.get('/tts-edge', async (req, res) => {
+  if (!WS_AVAILABLE) return res.status(503).json({ error: 'edge-tts-unavailable', message: '后端未加载 ws 模块，无法使用 Edge TTS（请执行 npm install ws 后重新部署）' });
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '');
+  if (!edgeRateOk(ip)) return res.status(429).json({ error: 'rate-limited', message: '请求过于频繁，请稍后再试' });
+  const text = String(req.query.text || '').slice(0, 500).trim();
+  if (!text) return res.status(400).json({ error: 'empty', message: '文本为空' });
+  let voice = String(req.query.voice || 'en-US-AriaNeural').slice(0, 40).trim();
+  if (!_edgeVoiceRe.test(voice)) voice = 'en-US-AriaNeural';
+  try {
+    const buf = await edgeTTS(text, voice);
+    if (!buf || !buf.length) return res.status(502).json({ error: 'edge-empty', message: 'Edge TTS 未返回音频' });
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    return res.send(buf);
+  } catch (e) {
+    res.status(502).json({ error: 'edge-failed', message: e.message || String(e) });
+  }
+});
+
 /* ---------- 模型池用量统计（叠加免费额度看板） ----------
  * 百炼免费额度按模型各自发放，后端薄代理按 CHAT_MODELS 顺序自动降级。
  * 这里累计每个模型当月已用 tokens，并落盘 usage.json（Render 重启会重置到部署快照，但至少展示实时累计）。
@@ -755,7 +860,7 @@ app.get('/', (req, res) => {
   <div class="card">
     <p>API Key：${hasKey ? '<span class="ok">已配置</span>' : '<span class="no">未配置（OCR 走本地 Tesseract 兜底，ASR 需走浏览器）</span>'}</p>
     <p>视觉服务商：<code>${VISION_PROVIDER}</code>　语音服务商：<code>${ASR_PROVIDER}</code></p>
-    <p>接口：<code>POST /ocr</code>（照片→4字段）　<code>POST /asr</code>（录音→文本）</p>
+    <p>接口：<code>POST /ocr</code>（照片→4字段）　<code>POST /asr</code>（录音→文本）　<code>GET /tts-edge</code>（免费 Edge 整句发音）</p>
     <p>状态：<span class="ok">服务正常</span></p>
   </div>
   <p class="muted">把本地址（含端口）填到「加贝英语台 → 设置 → 云端服务地址」即可。本服务已托管在云端，手机直接访问，无需内网穿透。</p>
