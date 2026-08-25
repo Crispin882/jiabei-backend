@@ -120,6 +120,7 @@ async function callQwenVision(dataUri) {
   const j = await r.json();
   if (j.error) { const c = j.error.code || ''; throw new Error(`云端视觉识别失败[${c}]：${j.error.message || JSON.stringify(j.error)}`); }
   const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content || '';
+  try { recordUsage(VISION_MODEL, j.usage || null, false); } catch (_) {}   // 模型池用量统计
   return extractWords(content);
 }
 
@@ -185,6 +186,7 @@ async function asrQwen(audioUrl) {
       if (!resultUrl) throw new Error('转写完成但无结果地址');
       const t = await (await fetch(resultUrl)).json();
       const text = (t.transcripts && t.transcripts[0] && t.transcripts[0].text) || t.text || '';
+      try { recordUsage(ASR_MODEL, null, false); } catch (_) {}             // 模型池用量统计
       // 没有有效语音时 Paraformer 会返回字面量 “SUCCESS_WITH_NO_VALID_FRAGMENT”，当作空识别（前端提示“没识别到声音”）
       if (/SUCCESS_WITH_NO_VALID_FRAGMENT|NO_VALID_FRAGMENT/i.test(text)) return '';
       return text;
@@ -527,7 +529,7 @@ async function chatQwen(messages, tried) {
     model: model,
     messages: messages,
     temperature: 0.7,
-    max_tokens: 160, // 控制 AI 回复长度（1 句短回复，适合 TTS 朗读、孩子模仿语调）
+    max_tokens: 300, // 私教式回复需要空间：鼓励+纠错+更好说法+下一步（1-3 短句），避免截断
     stream: true, // 流式输出：首 token 极快，前端边收边朗读，消除"整段等"
     // qwen3.6-flash 默认会走 thinking，首 token 慢；关闭思考可大幅加速短对话
     extra_body: { enable_thinking: false }
@@ -624,6 +626,7 @@ app.get('/tts', async (req, res) => {
     if (ct.includes('audio')) {
       const buf = Buffer.from(await r.arrayBuffer());
       res.set('Content-Type', ct.split(';')[0]);
+      try { recordUsage(model, null, false); } catch (_) {}                 // 模型池用量统计
       return res.send(buf);
     }
     // 非流式可能返回 JSON（含 audio_url）或错误
@@ -639,11 +642,13 @@ app.get('/tts', async (req, res) => {
         const b64 = audioUrl.split(',')[1] || '';
         const buf = Buffer.from(b64, 'base64');
         res.set('Content-Type', 'audio/wav');
+        try { recordUsage(model, null, false); } catch (_) {}               // 模型池用量统计
         return res.send(buf);
       }
       const ar = await fetch(audioUrl);
       const buf = Buffer.from(await ar.arrayBuffer());
       res.set('Content-Type', ar.headers.get('content-type') || 'audio/wav');
+      try { recordUsage(model, null, false); } catch (_) {}                 // 模型池用量统计
       return res.send(buf);
     }
     throw new Error('云端 TTS 未返回音频：' + JSON.stringify(j).slice(0, 200));
@@ -840,11 +845,28 @@ app.get('/chat-usage', (req, res) => {
       canDays: canDays > 365 ? '>1年' : (canDays + ' 天')
     };
   });
+  // 全模型清单：工作台用到的每个模型（用途/模型/提供商/免费说明/本月调用），供「设置→模型池」展示
+  const per = u.perModel || {};
+  const mk = (purpose, model, provider, note, callsKey) => ({
+    purpose, model, provider, free: true, note,
+    calls: (callsKey ? ((per[callsKey] || {}).calls || 0) : 0),
+    used: (callsKey ? ((per[callsKey] || {}).total || 0) : 0)
+  });
+  const all = [
+    mk('拍照识别（OCR 视觉）', VISION_PROVIDER === 'doubao' ? (ARK_ENDPOINT || 'doubao') : VISION_MODEL,
+       VISION_PROVIDER === 'doubao' ? '火山方舟' : '阿里云百炼', '百炼免费额度内（以控制台为准）', VISION_MODEL),
+    mk('语音识别（批量录音）', ASR_MODEL, '阿里云百炼', 'paraformer 免费额度内（以控制台为准）', ASR_MODEL),
+    mk('语音识别（实时边说边出字）', 'paraformer-realtime-v2', '阿里云百炼', '实时模型免费额度内（以控制台为准）', null),
+    ...CHAT_MODELS.map(m => mk('AI 对话陪练（自动降级池）', m, '阿里云百炼', 'flash 系列免费额度，自动切换（以控制台为准）', m)),
+    mk('语音合成（备用音源）', process.env.TTS_MODEL || 'qwen-audio-3.0-tts-flash', '阿里云百炼', '备用；主用免费 Edge，几乎不消耗', process.env.TTS_MODEL || 'qwen-audio-3.0-tts-flash'),
+    mk('语音合成（主用·纯正美音）', 'Edge TTS', '微软免费接口', '完全免费，无额度限制', null)
+  ];
   res.json({
     month: u.monthKey,
     rounds: u.rounds || 0,
     freePerModel: FREE_PER_MODEL,
     models: models,
+    all: all,
     note: '百炼免费额度按模型发放，后端自动降级；表中为保守估算，实际以官方为准。'
   });
 });
