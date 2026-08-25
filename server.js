@@ -509,6 +509,27 @@ const CHAT_MODELS = (process.env.CHAT_MODELS && process.env.CHAT_MODELS.split(',
        'qwen3.6-flash', 'qwen-flash', 'qwen3.5-flash', 'qwen-plus' ]
   .filter((v,i,a)=>a.indexOf(v)===i); // 去重，保留顺序
 
+// 模型生命周期（防"用着用着模型下线"）：status=stable 稳定 / sunset 近期将下线 / retired 已下线。
+// 依据 2026-08 核实：qwen-turbo 已确认 2026-10-10 下线；paraformer ASR 系列亦于 2026-10-10 下线（批量兜底路径受影响）。
+// 规则：retired/sunset 一律不进实际调用池（"会下线的一律不用"）；前端模型池据此显示状态标签。
+const MODEL_LIFECYCLE = {
+  'qwen-turbo':              { status: 'retired', note: '已下线（2026-10-10）' },
+  'paraformer-v2':           { status: 'sunset',  note: '即将下线（2026-10-10），建议迁 paraformer-realtime-v2' },
+  'qwen3.6-flash':           { status: 'stable',  note: '长期在架' },
+  'qwen-flash':              { status: 'stable',  note: '长期在架' },
+  'qwen3.5-flash':           { status: 'stable',  note: '' },
+  'qwen-plus':               { status: 'stable',  note: '' },
+  'paraformer-realtime-v2':  { status: 'stable',  note: '实时识别主力' },
+  'qwen3-vl-plus':           { status: 'stable',  note: '视觉识别' },
+  'qwen-audio-3.0-tts-flash':{ status: 'stable',  note: '备用音源' }
+};
+// 实际调用池：过滤掉已下线/即将下线的模型（保底：若全被过滤则退回原池，避免空池）
+const CHAT_POOL = (CHAT_MODELS.filter(m => {
+  const lc = MODEL_LIFECYCLE[m] || {};
+  return lc.status !== 'retired' && lc.status !== 'sunset';
+})).concat([]);
+const ACTIVE_CHAT_MODELS = CHAT_POOL.length ? CHAT_POOL : CHAT_MODELS;
+
 // 判断某模型错误是否属于「该模型不可用，应跳过尝试下一个」
 function isModelFatal(code, msg){
   const m = String(msg||'').toLowerCase();
@@ -521,8 +542,8 @@ function isModelFatal(code, msg){
 
 async function chatQwen(messages, tried) {
   tried = tried || [];
-  // 从池里挑第一个还没试过的模型
-  const model = CHAT_MODELS.find(m => !tried.includes(m));
+  // 从池里挑第一个还没试过的模型（池已过滤掉已下线/即将下线模型）
+  const model = ACTIVE_CHAT_MODELS.find(m => !tried.includes(m));
   if (!model) throw new Error('所有对话模型均不可用（可能全部下线或额度耗尽），请检查 CHAT_MODELS 配置或 DashScope 账户。');
   const url = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
   const body = {
@@ -827,15 +848,16 @@ app.post('/chat', express.json({ limit: '60kb' }), async (req, res) => {
 /* 用量看板：各模型本月已用 tokens、状态、预计还能练几天 */
 app.get('/chat-usage', (req, res) => {
   const u = loadUsage();
-  // 单模型免费额度保守估算（百炼 flash 系列通常每月数百万 tokens，这里取保守 1,000,000）
+  // 单模型免费额度保守估算（百炼 flash 系列通常每月数百万 tokens，这里取保守 1,000,000；
+  // 注意：免费额度的总量/剩余只能登录百炼控制台查看，无公开 API，此处为本地估算）
   const FREE_PER_MODEL = Number(process.env.CHAT_FREE_QUOTA) || 1000000;
-  const models = CHAT_MODELS.map(m => {
+  const dayOfMonth = new Date().getDate();
+  const daysLeft = Math.max(1, new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate() - dayOfMonth + 1);
+  const models = ACTIVE_CHAT_MODELS.map(m => {
     const s = u.perModel[m] || { prompt: 0, completion: 0, total: 0, calls: 0 };
     const used = s.total || 0;
     const remain = Math.max(0, FREE_PER_MODEL - used);
     // 按近况估算每天消耗：若有数据，用（已用/已过天数）做保守线性外推；否则给兜底预估
-    const dayOfMonth = new Date().getDate();
-    const daysLeft = Math.max(1, new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate() - dayOfMonth + 1);
     let perDay = 0;
     if (s.total > 0 && dayOfMonth > 0) perDay = s.total / dayOfMonth;
     const canDays = perDay > 0 ? Math.floor(remain / perDay) : 9999;
@@ -848,19 +870,35 @@ app.get('/chat-usage', (req, res) => {
       canDays: canDays > 365 ? '>1年' : (canDays + ' 天')
     };
   });
-  // 全模型清单：工作台用到的每个模型（用途/模型/提供商/免费说明/本月调用），供「设置→模型池」展示
+  // 全模型清单：工作台用到的每个模型（用途/模型/提供商/免费说明/本月调用/生命周期），供「设置→模型池」展示
   const per = u.perModel || {};
-  const mk = (purpose, model, provider, note, callsKey) => ({
-    purpose, model, provider, free: true, note,
+  const lcOf = m => {
+    const lc = MODEL_LIFECYCLE[m] || {};
+    return { status: lc.status || 'stable', note: lc.note || '' };
+  };
+  const mk = (purpose, model, provider, note, callsKey, extra) => ({
+    purpose, model, provider, free: true, note, lifecycle: lcOf(model),
     calls: (callsKey ? ((per[callsKey] || {}).calls || 0) : 0),
-    used: (callsKey ? ((per[callsKey] || {}).total || 0) : 0)
+    used: (callsKey ? ((per[callsKey] || {}).total || 0) : 0),
+    ...(extra || {})
   });
   const all = [
     mk('拍照识别（OCR 视觉）', VISION_PROVIDER === 'doubao' ? (ARK_ENDPOINT || 'doubao') : VISION_MODEL,
        VISION_PROVIDER === 'doubao' ? '火山方舟' : '阿里云百炼', '百炼免费额度内（以控制台为准）', VISION_MODEL),
-    mk('语音识别（批量录音）', ASR_MODEL, '阿里云百炼', 'paraformer 免费额度内（以控制台为准）', ASR_MODEL),
+    mk('语音识别（批量录音）', ASR_MODEL, '阿里云百炼', '批量兜底路径；即将下线则建议改用实时识别', ASR_MODEL),
     mk('语音识别（实时边说边出字）', 'paraformer-realtime-v2', '阿里云百炼', '实时模型免费额度内（以控制台为准）', null),
-    ...CHAT_MODELS.map(m => mk('AI 对话陪练（自动降级池）', m, '阿里云百炼', 'flash 系列免费额度，自动切换（以控制台为准）', m)),
+    ...ACTIVE_CHAT_MODELS.map(m => {
+      const s = u.perModel[m] || {};
+      const used = s.total || 0;
+      const remain = Math.max(0, FREE_PER_MODEL - used);
+      let perDay = 0;
+      if (s.total > 0 && dayOfMonth > 0) perDay = s.total / dayOfMonth;
+      const canDays = perDay > 0 ? Math.floor(remain / perDay) : 9999;
+      return mk('AI 对话陪练（自动降级池）', m, '阿里云百炼', 'flash 系列免费额度，自动切换（以控制台为准）', m, {
+        remain, status: used >= FREE_PER_MODEL ? 'exhausted' : 'ok',
+        canDays: canDays > 365 ? '>1年' : (canDays + ' 天')
+      });
+    }),
     mk('语音合成（备用音源）', process.env.TTS_MODEL || 'qwen-audio-3.0-tts-flash', '阿里云百炼', '备用；主用免费 Edge，几乎不消耗', process.env.TTS_MODEL || 'qwen-audio-3.0-tts-flash'),
     mk('语音合成（主用·纯正美音）', 'Edge TTS', '微软免费接口', '完全免费，无额度限制', null)
   ];
@@ -870,7 +908,8 @@ app.get('/chat-usage', (req, res) => {
     freePerModel: FREE_PER_MODEL,
     models: models,
     all: all,
-    note: '百炼免费额度按模型发放，后端自动降级；表中为保守估算，实际以官方为准。'
+    consoleUrl: 'https://bailian.console.aliyun.com/',
+    note: '免费额度的真实总量/剩余只能在百炼控制台查看（无公开 API），表中「剩余/还能练」为本地累计+保守估算；已下线或即将下线的模型已从调用池剔除。'
   });
 });
 
