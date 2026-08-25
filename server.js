@@ -683,7 +683,8 @@ function edgeDateStr() {
 }
 const _edgeVoiceRe = /^[a-z]{2}-[A-Z]{2}-[A-Za-z]+(Neural|Class)$/;
 
-function edgeTTS(text, voice) {
+function edgeTTS(text, voice, rate) {
+  rate = rate || '-15%';   // 默认放慢 15%：孩子听英语需要更慢的语速（可通过 ?rate= 覆盖）
   return new Promise((resolve, reject) => {
     const uid = () => crypto.randomUUID().replace(/-/g, '');
     const safe = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -727,7 +728,7 @@ function edgeTTS(text, voice) {
       const cfg = `X-Timestamp:${edgeDateStr()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n`;
       ws.send(cfg, { compress: true }, (e) => {
         if (e) return done(e);
-        const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='${voice}'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>${safe}</prosody></voice></speak>`;
+        const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='${voice}'><prosody pitch='+0Hz' rate='${rate}' volume='+0%'>${safe}</prosody></voice></speak>`;
         const msg = `X-RequestId:${uid()}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${edgeDateStr()}Z\r\nPath:ssml\r\n\r\n${ssml}`;
         ws.send(msg, { compress: true }, (e2) => { if (e2) done(e2); });
       });
@@ -751,8 +752,10 @@ app.get('/tts-edge', async (req, res) => {
   if (!text) return res.status(400).json({ error: 'empty', message: '文本为空' });
   let voice = String(req.query.voice || 'en-US-AriaNeural').slice(0, 40).trim();
   if (!_edgeVoiceRe.test(voice)) voice = 'en-US-AriaNeural';
+  let rate = String(req.query.rate || '-15%').slice(0, 8).trim();
+  if (!/^-?\d{1,2}%$/.test(rate)) rate = '-15%';   // 儿童学习默认放慢 15%
   try {
-    const buf = await edgeTTS(text, voice);
+    const buf = await edgeTTS(text, voice, rate);
     if (!buf || !buf.length) return res.status(502).json({ error: 'edge-empty', message: 'Edge TTS 未返回音频' });
     res.set('Content-Type', 'audio/mpeg');
     res.set('Cache-Control', 'public, max-age=86400');
