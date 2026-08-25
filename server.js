@@ -552,8 +552,10 @@ async function chatQwen(messages, tried) {
     temperature: 0.7,
     max_tokens: 300, // 私教式回复需要空间：鼓励+纠错+更好说法+下一步（1-3 短句），避免截断
     stream: true, // 流式输出：首 token 极快，前端边收边朗读，消除"整段等"
-    // qwen3.6-flash 默认会走 thinking，首 token 慢；关闭思考可大幅加速短对话
-    extra_body: { enable_thinking: false }
+    // 关键：qwen3.6-flash 默认走 thinking，首 token 慢；必须用【顶层】 enable_thinking:false 关闭。
+    // 注意不能用 extra_body（那是 OpenAI Python SDK 的写法；原生 fetch 直接发 JSON 时 extra_body 会被服务端忽略，
+    // 导致 thinking 从未关闭、每次回复都慢好几秒——2026-08-25 实测修正）。
+    enable_thinking: false
   };
   let r;
   try {
