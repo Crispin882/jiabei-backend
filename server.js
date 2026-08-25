@@ -504,21 +504,52 @@ app.get('/asr/status/:id', (req, res) => {
  * 另：paraformer ASR 系列亦于 2026-10-10 下线，需迁 paraformer-realtime-v2 等，属 ASR 改动，不在本段范围。
  */
 // 对话模型降级池（顺序=优先级）。可经环境变量 CHAT_MODEL 覆盖首选项；CHAT_MODELS 覆盖整个池。
+// 2026-08 官方核实（含下线公告 notice 2009/118434/117861）：
+//  - 免费额度：百炼新用户每模型 100 万 tokens（90 天有效，华北2/北京），qwen-plus 系列各版本独立额度 → 可叠加
+//  - 已下线：qwen3.5-flash（2026-01-30）、qwen-turbo 旧快照等
+//  - 2026-10-10 即将下线：qwen-turbo 全系、qwen3-max-preview、qwen3.6-max-preview、
+//    qwen3-max-2026-01-23 / qwen3-max-2025-09-23、qwq-plus、qwen-vl-max/plus 旧版、qwen-coder 系、paraformer 全系、
+//    **qwen-plus-0112、qwen-plus-1220、qwen-plus-2025-07-28、qwen-plus-2025-09-11、qwen-plus-2025-12-01-us**（→ qwen3.7-plus）
+//  - 重要：无日期版 qwen-plus 自 2026-01-20 起自动指向 qwen-plus-2025-12-01 快照（官方公告 117861）→ 安全
+//  - qwen3.7-max / qwen3.7-plus 免费额度仅限国际部署（我们走中国内地）→ 不选
+//  - 安全可叠加（有免费额度）：qwen-plus（自动=2025-12-01）+ qwen-plus-2025-12-01（独立额度）
+//    + qwen-flash 系 + qwen-long + qwen-max（旗舰）+ qwen3.6-flash（保底）
 const CHAT_MODELS = (process.env.CHAT_MODELS && process.env.CHAT_MODELS.split(',').map(s=>s.trim()).filter(Boolean))
-  || [ process.env.CHAT_MODEL || 'qwen3.6-flash',
-       'qwen3.6-flash', 'qwen-flash', 'qwen3.5-flash', 'qwen-plus' ]
+  || [ process.env.CHAT_MODEL || 'qwen-plus',
+       'qwen-plus', 'qwen-plus-2025-12-01',
+       'qwen-flash', 'qwen-flash-2025-07-28',
+       'qwen-long', 'qwen-max', 'qwen3.6-flash' ]
   .filter((v,i,a)=>a.indexOf(v)===i); // 去重，保留顺序
 
 // 模型生命周期（防"用着用着模型下线"）：status=stable 稳定 / sunset 近期将下线 / retired 已下线。
-// 依据 2026-08 核实：qwen-turbo 已确认 2026-10-10 下线；paraformer ASR 系列亦于 2026-10-10 下线（批量兜底路径受影响）。
+// 依据 2026-08 官方公告核实（见上面 CHAT_MODELS 注释）：
 // 规则：retired/sunset 一律不进实际调用池（"会下线的一律不用"）；前端模型池据此显示状态标签。
 const MODEL_LIFECYCLE = {
+  'qwen3.5-flash':           { status: 'retired', note: '已下线（2026-01-30）' },
   'qwen-turbo':              { status: 'retired', note: '已下线（2026-10-10）' },
+  'qwen3-max-preview':       { status: 'sunset',  note: '即将下线（2026-10-10），用 qwen-max' },
+  'qwen3.6-max-preview':     { status: 'sunset',  note: '即将下线（2026-10-10），用 qwen-max' },
+  'qwen3-max-2026-01-23':    { status: 'sunset',  note: '即将下线（2026-10-10）' },
+  'qwen3-max-2025-09-23':    { status: 'sunset',  note: '即将下线（2026-10-10）' },
+  'qwen-coder-turbo':        { status: 'sunset',  note: '即将下线（2026-10-10）' },
+  'qwen-coder-plus':         { status: 'sunset',  note: '即将下线（2026-10-10）' },
+  'qwq-plus':                { status: 'sunset',  note: '即将下线（2026-10-10）' },
+  'qwen-vl-max':             { status: 'sunset',  note: '即将下线（2026-10-10），用 qwen3-vl-plus' },
+  'qwen-vl-plus':            { status: 'sunset',  note: '即将下线（2026-10-10），用 qwen3-vl-plus' },
   'paraformer-v2':           { status: 'sunset',  note: '即将下线（2026-10-10），建议迁 paraformer-realtime-v2' },
-  'qwen3.6-flash':           { status: 'stable',  note: '长期在架' },
-  'qwen-flash':              { status: 'stable',  note: '长期在架' },
-  'qwen3.5-flash':           { status: 'stable',  note: '' },
-  'qwen-plus':               { status: 'stable',  note: '' },
+  'qwen-plus':               { status: 'stable',  note: '主力·自动指向最新快照(2025-12-01)' },
+  'qwen-plus-2025-12-01':    { status: 'stable',  note: '主力快照·当前版本' },
+  'qwen-plus-0112':          { status: 'sunset',  note: '即将下线（2026-10-10）→ qwen-plus(自动新版)' },
+  'qwen-plus-2025-07-28':    { status: 'sunset',  note: '即将下线（2026-10-10）→ qwen-plus(自动新版)' },
+  'qwen-plus-2025-09-11':    { status: 'sunset',  note: '即将下线（2026-10-10）' },
+  'qwen-plus-1220':          { status: 'sunset',  note: '即将下线（2026-10-10）' },
+  'qwen-plus-2025-12-01-us': { status: 'sunset',  note: '即将下线（2026-10-10）' },
+  'qwen-flash':              { status: 'stable',  note: '速度型' },
+  'qwen-flash-2025-07-28':   { status: 'stable',  note: '' },
+  'qwen-flash-2026-01-25':   { status: 'stable',  note: '' },
+  'qwen-long':               { status: 'stable',  note: '长上下文 256K' },
+  'qwen-max':                { status: 'stable',  note: '旗舰·额度小慎用' },
+  'qwen3.6-flash':           { status: 'stable',  note: '保底' },
   'paraformer-realtime-v2':  { status: 'stable',  note: '实时识别主力' },
   'qwen3-vl-plus':           { status: 'stable',  note: '视觉识别' },
   'qwen-audio-3.0-tts-flash':{ status: 'stable',  note: '备用音源' }
