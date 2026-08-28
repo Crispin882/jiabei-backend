@@ -371,7 +371,38 @@ app.get('/free-sentence', async (req, res) => {
 // 本地适龄对话 / 短文子集（与前端 assets/data 同源思路，但放在后端便于“换一批”随机且离线）
 let _ddSafe = null, _pgSafe = null;
 try { _ddSafe = require('./dailydialog_safe.json'); } catch (e) { _ddSafe = []; }
-try { _pgSafe = require('./passages_safe.json'); } catch (e) { _pgSafe = []; }
+// 内置短文库：直接内联，保证部署 server.js 这一个文件就必然带中文翻译（zh 与 lines 逐句对应）。
+// 若外部 passages_safe.json 存在且确实含中文，则优先用外部（便于后续扩展）；否则回退内联版本。
+const BUILTIN_PASSAGES = [
+  { title:"My Red Cat", level:"入门", lines:["I have a small red cat.","Her name is Mimi.","She likes to sleep on my bed.","Every morning she says meow to me.","I love my little red cat."],
+    zh:["我有一只小小的红猫。","她的名字叫咪咪。","她喜欢睡在我的床上。","每天早晨她都对我喵喵叫。","我爱我的小红猫。"] },
+  { title:"A Sunny Day", level:"入门", lines:["Today is a sunny day.","The sky is blue and the sun is warm.","I go to the park with my friend.","We run and laugh on the green grass.","We are very happy."],
+    zh:["今天是个晴天。","天空蓝蓝的，阳光暖暖的。","我和朋友一起去公园。","我们在绿草地上奔跑欢笑。","我们特别开心。"] },
+  { title:"My School", level:"初级", lines:["My school is big and clean.","There are many classrooms and a library.","My teacher is kind and patient.","I read books and make new friends at school.","I like going to school every day."],
+    zh:["我的学校又大又干净。","有很多教室和一个图书馆。","我的老师既善良又有耐心。","我在学校读书，还交到了新朋友。","我每天都喜欢去上学。"] },
+  { title:"The Little Dog", level:"初级", lines:["A little dog is lost in the street.","He looks sad and hungry.","A boy gives him some water and bread.","The dog wags his tail to say thank you.","Now they are good friends."],
+    zh:["一只小狗在街上迷路了。","它看起来又伤心又饿。","一个男孩给了它一些水和面包。","小狗摇着尾巴说谢谢。","现在它们成了好朋友。"] },
+  { title:"Apple Tree", level:"初级", lines:["We plant a small apple tree in spring.","We water it when the sun is hot.","In autumn the tree has red apples.","My mother makes a sweet apple pie.","The whole family enjoys the pie together."],
+    zh:["春天我们种下一棵小苹果树。","太阳热的时候我们给它浇水。","秋天树上结满了红苹果。","妈妈做了一个香甜的苹果派。","全家人一起分享这个派。"] },
+  { title:"My Family", level:"初级", lines:["There are four people in my family.","My father is a doctor and my mother is a teacher.","My sister and I go to the same school.","We eat dinner and talk about our day.","I feel warm and safe with my family."],
+    zh:["我家有四口人。","爸爸是医生，妈妈是老师。","姐姐和我在同一所学校。","我们一边吃晚饭，一边聊今天的事。","和家人在一起我觉得温暖又安心。"] },
+  { title:"Rainy Morning", level:"中级", lines:["It is raining when I wake up in the morning.","The rain taps softly on the window.","I put on my yellow raincoat and boots.","On the way to school I see a small frog.","Rainy days can be quiet and beautiful too."],
+    zh:["早上我醒来时，外面正在下雨。","雨点轻轻敲打着窗户。","我穿上黄色的雨衣和雨靴。","上学路上我看见一只小青蛙。","雨天也可以安静又美好。"] },
+  { title:"The Helpful Robot", level:"中级", lines:["My uncle makes a small robot at home.","The robot can sweep the floor and sing songs.","It helps my grandma carry light things.","We teach it to say hello in English.","Technology can be a good friend to people."],
+    zh:["叔叔在家里做了一个小机器人。","机器人会扫地，还会唱歌。","它帮奶奶拿轻一点的东西。","我们教它用英语说你好。","科技也能成为人们的好朋友。"] },
+  { title:"A Trip to the Zoo", level:"中级", lines:["Last Sunday our class visits the zoo.","We see tall giraffes and funny monkeys.","The panda eats bamboo slowly and looks cute.","Our teacher tells us to protect animals.","I learn a lot and want to come again."],
+    zh:["上周日我们班去动物园玩。","我们看到了高高的长颈鹿和调皮的猴子。","熊猫慢吞吞地吃着竹子，样子真可爱。","老师告诉我们都要爱护动物。","我学到了很多，还想再来一次。"] },
+  { title:"My Dream", level:"中级", lines:["When I grow up I want to be a pilot.","I will fly to many countries and see the world.","I will learn English well to talk with friends everywhere.","I will also help people who need a ride home.","I believe my dream can come true with hard work."],
+    zh:["长大后我想当一名飞行员。","我要飞去很多国家，看看这个世界。","我要学好英语，和各地的朋友聊天。","我也会帮助那些需要回家的人。","我相信只要努力，梦想就能实现。"] },
+  { title:"The Lost Star", level:"高级", lines:["One night a little star falls from the sky.","It lands quietly in a small quiet village.","A boy finds it and keeps it in a glass jar.","The star gives a soft light that makes him calm.","He lets it go so it can shine for everyone again."],
+    zh:["一天夜里，一颗小星星从天上掉了下来。","它悄悄落在一个安静的小村庄里。","一个男孩发现了它，把它放进玻璃罐里。","星星发出柔和的光，让他感到平静。","他放它飞走，让它重新为所有人发光。"] },
+  { title:"The Brave Little Boat", level:"高级", lines:["A small wooden boat sails far across the sea.","It meets big waves but never gives up.","A friendly dolphin shows the way home.","At last it reaches a warm and sunny shore.","The little boat learns that courage brings safe harbor."],
+    zh:["一只小木船远远地航行在大海上。","它遇到巨大的海浪，却从不放弃。","一只友善的海豚为它指路回家。","终于，它抵达了温暖而阳光明媚的岸边。","小船明白了：勇气能带来安全的港湾。"] }
+];
+try {
+  const ext = require('./passages_safe.json');
+  _pgSafe = (ext && ext.length && ext.some(p => p && p.zh)) ? ext : BUILTIN_PASSAGES;
+} catch (e) { _pgSafe = BUILTIN_PASSAGES; }
 
 app.get('/free-dialog', (req, res) => {
   const offset = parseInt(req.query.offset) || 0;
