@@ -382,7 +382,13 @@ app.get('/free-dialog', (req, res) => {
 
 app.get('/free-passage', (req, res) => {
   const offset = parseInt(req.query.offset) || 0;
-  const pool = shuffle(_pgSafe || []);
+  const wantLevel = String(req.query.level || '').trim();
+  let pool = shuffle(_pgSafe || []);
+  // 按难度过滤（前端传 入门/初级/中级/高级；为空或命中不到则回退全部）
+  if (wantLevel) {
+    const matched = pool.filter(p => (p.level || '').includes(wantLevel));
+    if (matched.length) pool = matched;
+  }
   const pick = pool.slice(offset % Math.max(pool.length, 1), (offset % Math.max(pool.length, 1)) + 4);
   res.json({ ok: true, items: pick.length ? pick : (pool.slice(0, 4)) });
 });
