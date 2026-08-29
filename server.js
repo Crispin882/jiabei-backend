@@ -48,16 +48,18 @@ const OCR_PROMPT = `你是一个英语单词卡片识别器。图片里是单词
 只返回 JSON 数组本身，不要任何解释、不要 markdown 代码块标记。`;
 
 // 短文拍照识图提示词：识别英文短文 + 对应中文翻译，按原文段落/分栏顺序组织为 paragraphs
-const PASSAGE_OCR_PROMPT = `你是一个英语短文识别器。图片是一段英语短文，可能带有中文翻译。图片可能有以下三种版式之一：
+const PASSAGE_OCR_PROMPT = `你是一个英语短文识别器。输入是 1 到多张图片，内容为同一篇英语短文（可能分多张拍摄），可能带有中文翻译。图片可能有以下三种版式之一：
 (a) 英文句子与中文翻译逐行交替（一句英文，紧接着一句中文）；
 (b) 左右双栏（左栏英文，右栏中文）；
 (c) 先整段英文、再整段中文。
-请识别图中所有英文句子及其对应的中文翻译，严格按原文出现的段落/分栏顺序排列。只输出合法 JSON（不要 markdown、不要任何解释）：
+请按图片顺序（第 1 张、第 2 张、第 3 张……）通读所有英文句子及其对应的中文翻译，合并成「一篇完整短文」，严格按原文出现的段落/分栏顺序排列。只输出合法 JSON（不要 markdown、不要任何解释）：
 {"title":string, "level":"入门"|"初级"|"中级"|"高级"（无法判断可留空字符串 ""）, "paragraphs":[[{"en":string,"zh":string}]]}
 要求：
 - paragraphs 是段落数组；每段是句子数组；每句含 en（英文句子）和 zh（对应中文翻译）。
 - en 与 zh 必须一一对应；若某句没有对应翻译，zh 设为空字符串 ""。
-- 段落划分遵循原文的换行或分栏；原文没有分段的，合并为一个段落（paragraphs 长度为 1）。
+- 一句英文就是一句，不要把相邻多句错误地合并成一个 en；也不要把一句拆成两句。
+- 段落划分遵循原文的换行或分栏；某张图内原文有分段则保留段落；跨页处原文无明确分段则顺接为同一段（必要时可在此处另起一段）。
+- 多张图的内容是同一篇短文的不同部分，请按顺序拼接，不要重复、不要遗漏。
 - 忠实原图，不要编造原文没有的句子；英文拼写尽量准确。`;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -114,13 +116,51 @@ async function visionOCR(buf, mime) {
 }
 
 // 短文拍照识图：复用视觉模型，换用 PASSAGE_OCR_PROMPT，返回 {title, level, paragraphs}
-async function visionPassageOCR(buf, mime) {
-  const b64 = buf.toString('base64');
-  const dataUri = `data:${mime || 'image/jpeg'};base64,${b64}`;
+// 支持多张图片（同一篇短文分多张拍）：buffers/mimes 为数组，按顺序合并成一篇完整短文
+async function visionPassageOCR(buffers, mimes) {
+  const dataUris = (buffers || []).map(function (b, i) {
+    return `data:${mimes[i] || 'image/jpeg'};base64,${b.toString('base64')}`;
+  });
   let content;
-  if (VISION_PROVIDER === 'doubao') content = await callDoubaoVision(dataUri, PASSAGE_OCR_PROMPT);
-  else content = await callQwenVision(dataUri, PASSAGE_OCR_PROMPT);
+  if (VISION_PROVIDER === 'doubao') content = await callDoubaoVisionMulti(dataUris, PASSAGE_OCR_PROMPT);
+  else content = await callQwenVisionMulti(dataUris, PASSAGE_OCR_PROMPT);
   return extractPassage(content);
+}
+
+// 多图视觉调用：content 数组中按顺序放多张 image_url，再跟文本提示
+async function callQwenVisionMulti(dataUris, promptText) {
+  const url = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
+  const content = dataUris.map(function (u) { return { type: 'image_url', image_url: { url: u } }; });
+  content.push({ type: 'text', text: promptText || PASSAGE_OCR_PROMPT });
+  const body = { model: VISION_MODEL, messages: [{ role: 'user', content: content }] };
+  const r = await fetch(url, {
+    method: 'POST',
+    signal: AbortSignal.timeout(90000),
+    headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const j = await r.json();
+  if (j.error) { const c = j.error.code || ''; throw new Error(`云端视觉识别失败[${c}]：${j.error.message || JSON.stringify(j.error)}`); }
+  const out = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content || '';
+  try { recordUsage(VISION_MODEL, j.usage || null, false); } catch (_) {}
+  return out;
+}
+
+async function callDoubaoVisionMulti(dataUris, promptText) {
+  if (!ARK_ENDPOINT) throw new Error('豆包需配置 ARK_ENDPOINT');
+  const url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
+  const content = dataUris.map(function (u) { return { type: 'image_url', image_url: { url: u } }; });
+  content.push({ type: 'text', text: promptText || PASSAGE_OCR_PROMPT });
+  const body = { model: ARK_ENDPOINT, messages: [{ role: 'user', content: content }] };
+  const r = await fetch(url, {
+    method: 'POST',
+    signal: AbortSignal.timeout(60000),
+    headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+  return j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content || '';
 }
 
 async function callQwenVision(dataUri, promptText) {
@@ -537,10 +577,12 @@ app.get('/ocr/status/:id', (req, res) => {
 });
 
 // 短文拍照识图：复用 /ocr 的异步上传管道，换用视觉短文提示词，返回 {title, level, paragraphs}
-app.post('/ocr-passage', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: '未收到图片' });
+// 支持多张图片（同一篇短文分多张拍）：表单字段名 images，最多 6 张，按顺序合并成一篇完整短文
+app.post('/ocr-passage', upload.array('images', 6), (req, res) => {
+  const files = (req.files && req.files.length) ? req.files : (req.file ? [req.file] : []);
+  if (!files.length) return res.status(400).json({ error: '未收到图片' });
   const id = newTask();
-  const buf = req.file.buffer, mime = req.file.mimetype;
+  const buffers = files.map(f => f.buffer), mimes = files.map(f => f.mimetype);
   (async () => {
     try {
       if (!(API_KEY && VISION_PROVIDER !== 'none')) {
@@ -549,7 +591,7 @@ app.post('/ocr-passage', upload.single('file'), (req, res) => {
       }
       let passage, source;
       try {
-        passage = await visionPassageOCR(buf, mime);
+        passage = await visionPassageOCR(buffers, mimes);
         source = 'vision:' + VISION_PROVIDER;
       } catch (e) {
         finishTask(id, { status: 'error', error: '云端视觉识别失败：' + (e && e.message || e) + '（可能是免费额度用尽，请稍后重试或改用「我自己写」）' });
