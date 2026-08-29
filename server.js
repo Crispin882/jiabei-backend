@@ -47,6 +47,19 @@ const OCR_PROMPT = `你是一个英语单词卡片识别器。图片里是单词
 请识别并返回 JSON 数组，每个元素包含字段：en(英文单词)、phonetic(国际音标，不要斜杠，如 nekst)、pos(词性缩写如 n./v./adj./adv.)、zh(中文意思)、ex(英文例句，没有就填空字符串)。
 只返回 JSON 数组本身，不要任何解释、不要 markdown 代码块标记。`;
 
+// 短文拍照识图提示词：识别英文短文 + 对应中文翻译，按原文段落/分栏顺序组织为 paragraphs
+const PASSAGE_OCR_PROMPT = `你是一个英语短文识别器。图片是一段英语短文，可能带有中文翻译。图片可能有以下三种版式之一：
+(a) 英文句子与中文翻译逐行交替（一句英文，紧接着一句中文）；
+(b) 左右双栏（左栏英文，右栏中文）；
+(c) 先整段英文、再整段中文。
+请识别图中所有英文句子及其对应的中文翻译，严格按原文出现的段落/分栏顺序排列。只输出合法 JSON（不要 markdown、不要任何解释）：
+{"title":string, "level":"入门"|"初级"|"中级"|"高级"（无法判断可留空字符串 ""）, "paragraphs":[[{"en":string,"zh":string}]]}
+要求：
+- paragraphs 是段落数组；每段是句子数组；每句含 en（英文句子）和 zh（对应中文翻译）。
+- en 与 zh 必须一一对应；若某句没有对应翻译，zh 设为空字符串 ""。
+- 段落划分遵循原文的换行或分栏；原文没有分段的，合并为一个段落（paragraphs 长度为 1）。
+- 忠实原图，不要编造原文没有的句子；英文拼写尽量准确。`;
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ---------- 解析模型返回的 JSON ---------- */
@@ -94,11 +107,23 @@ function parseOcrText(text) {
 async function visionOCR(buf, mime) {
   const b64 = buf.toString('base64');
   const dataUri = `data:${mime || 'image/jpeg'};base64,${b64}`;
-  if (VISION_PROVIDER === 'doubao') return callDoubaoVision(dataUri);
-  return callQwenVision(dataUri);
+  let content;
+  if (VISION_PROVIDER === 'doubao') content = await callDoubaoVision(dataUri, OCR_PROMPT);
+  else content = await callQwenVision(dataUri, OCR_PROMPT);
+  return extractWords(content);
 }
 
-async function callQwenVision(dataUri) {
+// 短文拍照识图：复用视觉模型，换用 PASSAGE_OCR_PROMPT，返回 {title, level, paragraphs}
+async function visionPassageOCR(buf, mime) {
+  const b64 = buf.toString('base64');
+  const dataUri = `data:${mime || 'image/jpeg'};base64,${b64}`;
+  let content;
+  if (VISION_PROVIDER === 'doubao') content = await callDoubaoVision(dataUri, PASSAGE_OCR_PROMPT);
+  else content = await callQwenVision(dataUri, PASSAGE_OCR_PROMPT);
+  return extractPassage(content);
+}
+
+async function callQwenVision(dataUri, promptText) {
   const url = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
   // 兼容模式(OpenAI 格式)要求图像用 image_url 结构，不能用原生 {image:...}
   const body = {
@@ -107,7 +132,7 @@ async function callQwenVision(dataUri) {
       role: 'user',
       content: [
         { type: 'image_url', image_url: { url: dataUri } },
-        { type: 'text', text: OCR_PROMPT }
+        { type: 'text', text: promptText || OCR_PROMPT }
       ]
     }]
   };
@@ -121,15 +146,15 @@ async function callQwenVision(dataUri) {
   if (j.error) { const c = j.error.code || ''; throw new Error(`云端视觉识别失败[${c}]：${j.error.message || JSON.stringify(j.error)}`); }
   const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content || '';
   try { recordUsage(VISION_MODEL, j.usage || null, false); } catch (_) {}   // 模型池用量统计
-  return extractWords(content);
+  return content;
 }
 
-async function callDoubaoVision(dataUri) {
+async function callDoubaoVision(dataUri, promptText) {
   if (!ARK_ENDPOINT) throw new Error('豆包需配置 ARK_ENDPOINT');
   const url = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
   const body = {
     model: ARK_ENDPOINT,
-    messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: dataUri } }, { type: 'text', text: OCR_PROMPT }] }]
+    messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: dataUri } }, { type: 'text', text: promptText || OCR_PROMPT }] }]
   };
   const r = await fetch(url, {
     method: 'POST',
@@ -140,7 +165,31 @@ async function callDoubaoVision(dataUri) {
   const j = await r.json();
   if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
   const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content || '';
-  return extractWords(content);
+  return content;
+}
+
+// 解析视觉模型返回的短文 JSON，规范化为 {title, level, paragraphs:[[{en,zh}]]}
+function extractPassage(content) {
+  if (!content) return { title: '', level: '', paragraphs: [] };
+  let s = String(content).trim();
+  s = s.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+  const a = s.indexOf('{'), b = s.lastIndexOf('}');
+  if (a >= 0 && b > a) s = s.slice(a, b + 1);
+  let obj;
+  try { obj = JSON.parse(s); }
+  catch (_) {
+    // 容错：去尾逗号 + 补对象/数组元素间逗号后重试一次
+    try { obj = JSON.parse(s.replace(/,\s*([\]\}])/g, '$1').replace(/\}\s*\{/g, '},{').replace(/\]\s*\[/g, '],[')); }
+    catch (e2) { return { title: '', level: '', paragraphs: [] }; }
+  }
+  if (!obj || !Array.isArray(obj.paragraphs)) return { title: '', level: '', paragraphs: [] };
+  const paragraphs = obj.paragraphs.map(function (para) {
+    return (para || []).map(function (s2) {
+      if (typeof s2 === 'string') return { en: s2.trim(), zh: '' };
+      return { en: (s2.en || '').trim(), zh: (s2.zh || '').trim() };
+    }).filter(function (x) { return x.en; });
+  }).filter(function (p) { return p.length; });
+  return { title: (obj.title || '').trim(), level: (obj.level || '').trim(), paragraphs: paragraphs };
 }
 
 /* ---------- 无 key 本地 Tesseract 兜底 ---------- */
@@ -485,6 +534,31 @@ app.get('/ocr/status/:id', (req, res) => {
   }
   consumeTask(req.params.id);
   res.json(t);
+});
+
+// 短文拍照识图：复用 /ocr 的异步上传管道，换用视觉短文提示词，返回 {title, level, paragraphs}
+app.post('/ocr-passage', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: '未收到图片' });
+  const id = newTask();
+  const buf = req.file.buffer, mime = req.file.mimetype;
+  (async () => {
+    try {
+      if (!(API_KEY && VISION_PROVIDER !== 'none')) {
+        finishTask(id, { status: 'error', error: '未配置视觉识别 Key（VISION_PROVIDER 设为 none 或无 API_KEY），无法做拍照识图。请改用「我自己写」手动粘贴。' });
+        return;
+      }
+      let passage, source;
+      try {
+        passage = await visionPassageOCR(buf, mime);
+        source = 'vision:' + VISION_PROVIDER;
+      } catch (e) {
+        finishTask(id, { status: 'error', error: '云端视觉识别失败：' + (e && e.message || e) + '（可能是免费额度用尽，请稍后重试或改用「我自己写」）' });
+        return;
+      }
+      finishTask(id, { status: 'done', passage: passage || { title: '', level: '', paragraphs: [] }, source: source });
+    } catch (e) { finishTask(id, { status: 'error', error: e.message || String(e) }); }
+  })();
+  res.status(202).json({ taskId: id, status: 'processing' });
 });
 
 app.post('/asr', upload.single('file'), (req, res) => {
