@@ -622,7 +622,7 @@ async function chatQwen(messages, tried) {
     model: model,
     messages: messages,
     temperature: 0.7,
-    max_tokens: 300, // 私教式回复需要空间：鼓励+纠错+更好说法+下一步（1-3 短句），避免截断
+    max_tokens: 2000, // 需覆盖短文/对话/例句生成（高级短文 11-15 句+逐句中文翻译约 1.5k tokens），私教聊天一般远小于此
     stream: true, // 流式输出：首 token 极快，前端边收边朗读，消除"整段等"
     // 关键：qwen3.6-flash 默认走 thinking，首 token 慢；必须用【顶层】 enable_thinking:false 关闭。
     // 注意不能用 extra_body（那是 OpenAI Python SDK 的写法；原生 fetch 直接发 JSON 时 extra_body 会被服务端忽略，
