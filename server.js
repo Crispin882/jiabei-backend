@@ -530,7 +530,8 @@ app.get('/diag', (req, res) => {
     effectiveSource: effSource,
     apiKeySet: !!process.env.API_KEY,
     dashscopeKeySet: !!process.env.DASHSCOPE_API_KEY,
-    visionProvider: VISION_PROVIDER, visionModel: VISION_MODEL, asrModel: ASR_MODEL
+    visionProvider: VISION_PROVIDER, visionModel: VISION_MODEL, asrModel: ASR_MODEL,
+    chatModels: ACTIVE_CHAT_MODELS, audioModels: ACTIVE_AUDIO_MODELS   // 语音直连池，便于部署后自检
   });
 });
 
@@ -709,7 +710,14 @@ const MODEL_LIFECYCLE = {
   'qwen3.6-flash':           { status: 'stable',  note: '保底' },
   'paraformer-realtime-v2':  { status: 'stable',  note: '实时识别主力' },
   'qwen3-vl-plus':           { status: 'stable',  note: '视觉识别' },
-  'qwen-audio-3.0-tts-flash':{ status: 'stable',  note: '备用音源' }
+  'qwen-audio-3.0-tts-flash':{ status: 'stable',  note: '备用音源' },
+  // 语音直连（Omni 音频大模型）：现役三款进池；停更/体验版一律标 sunset|retired 不进调用池
+  'qwen3.5-omni-plus':       { status: 'stable',  note: '语音直连·旗舰·100万免费' },
+  'qwen3.5-omni-flash':      { status: 'stable',  note: '语音直连·主力·100万免费' },
+  'qwen3-omni-flash':        { status: 'stable',  note: '语音直连·最便宜·100万免费' },
+  'qwen-omni-turbo':         { status: 'sunset',  note: '旧版停更，官方建议新项目用 Qwen3.5-Omni → 不进调用池' },
+  'qwen-audio-turbo':        { status: 'retired', note: '仅供免费体验，官方建议迁 Omni' },
+  'qwen2-audio-instruct':    { status: 'retired', note: '仅供免费体验，官方建议迁 Omni' }
 };
 // 实际调用池：过滤掉已下线/即将下线的模型（保底：若全被过滤则退回原池，避免空池）
 const CHAT_POOL = (CHAT_MODELS.filter(m => {
@@ -717,6 +725,39 @@ const CHAT_POOL = (CHAT_MODELS.filter(m => {
   return lc.status !== 'retired' && lc.status !== 'sunset';
 })).concat([]);
 const ACTIVE_CHAT_MODELS = CHAT_POOL.length ? CHAT_POOL : CHAT_MODELS;
+
+/* ---------- 语音直连：Omni 音频模型池（与上面的纯文本池完全独立） ----------
+ * 「路线 A」：孩子说完一句，把【原始音频】直接发给音频大模型，模型听懂后回文字（不再只给 ASR 文字）。
+ * 两个池各自降级、各自计免费额度，互不干扰。
+ *
+ * 选型依据（2026-08/09 官方全模态文档 + 计费页核实）：
+ *  - 只选「当前代主力」：qwen3.5-omni-plus / qwen3.5-omni-flash / qwen3-omni-flash，
+ *    均活跃维护、未进任何下线清单、各 100 万 tokens 免费额度（华北2 北京、90 天有效）→ 叠加 300 万。
+ *  - 刻意排除 qwen-omni-turbo：官方已标「旧版不再更新，新项目建议用 Qwen3.5-Omni」→ 停更模型有下线风险
+ *    （用户决策：会下线的一律不用），仅在 MODEL_LIFECYCLE 标 sunset，不进调用池。
+ *  - 刻意排除 qwen-audio-turbo / qwen2-audio-instruct：官方明确「仅供免费体验、额度用完不可调用且不付费」，
+ *    且 Qwen-Audio 历史主线已进入下线清单 → 不符合「近期不下线」。
+ *  - 日期快照版（qwen3.5-omni-plus-2026-03-15 等）理论各自带独立 100 万额度；待控制台确认后
+ *    可用 AUDIO_CHAT_MODELS 环境变量直接追加，无需改代码。
+ *
+ * 官方硬约束（影响实现，勿改）：
+ *  1) stream 必须为 true，否则报错；
+ *  2) 一条 user 消息只能带「文字 + 一种额外模态」→ 只把最新一轮传音频，历史全部走文字（也最省 token）；
+ *  3) assistant 消息只支持文字；
+ *  4) modalities 固定 ["text"]：只回文字，语音仍由免费 Edge TTS 朗读（省钱、音质一致）；
+ *  5) Omni 会「解释所有声音」（音乐、环境音也会描述）→ system prompt 必须明确只回应人声。
+ */
+const AUDIO_CHAT_MODELS = (process.env.AUDIO_CHAT_MODELS && process.env.AUDIO_CHAT_MODELS.split(',').map(s=>s.trim()).filter(Boolean))
+  || ['qwen3.5-omni-plus', 'qwen3.5-omni-flash', 'qwen3-omni-flash']
+  .filter((v,i,a)=>a.indexOf(v)===i);
+const AUDIO_POOL = AUDIO_CHAT_MODELS.filter(m => {
+  const lc = MODEL_LIFECYCLE[m] || {};
+  return lc.status !== 'retired' && lc.status !== 'sunset';
+});
+const ACTIVE_AUDIO_MODELS = AUDIO_POOL.length ? AUDIO_POOL : AUDIO_CHAT_MODELS;
+
+// 挂在音频轮次上的固定指令：让模型以音频为准，并忽略非人声（Omni 默认会描述一切声音）
+const AUDIO_LISTEN_HINT = '（上面这段音频是孩子刚说的英语。请以音频内容为准来理解并回应；忽略环境噪音、回声或任何其他声音。只回应孩子本人说的话。）';
 
 // 判断某模型错误是否属于「该模型不可用，应跳过尝试下一个」
 function isModelFatal(code, msg){
@@ -816,6 +857,63 @@ async function consumeStream(r, model){
     }
   }
   return { text: text.trim(), model, sawChunk, usage };
+}
+
+/* ---------- 语音直连：把孩子的原始音频直接交给 Omni 音频模型 ----------
+ * messages：前端传来的完整历史（含 system prompt 作 messages[0]），全部按文字透传；
+ * audioDataUri：本次录音的 data URI（data:audio/wav;base64,xxx），只挂在最后一轮 user 消息上。
+ * 之所以只挂最后一轮：官方限制「一条 user 消息只能带文字 + 一种额外模态」，且历史轮次带音频会成倍吃 token。
+ */
+async function chatOmniAudio(messages, audioDataUri, tried) {
+  tried = tried || [];
+  const model = ACTIVE_AUDIO_MODELS.find(m => !tried.includes(m));
+  if (!model) throw new Error('所有语音模型均不可用（可能全部下线或额度耗尽），已自动回退文字模式。');
+  const msgs = (messages || []).slice();
+  let lastUserIdx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) { if (msgs[i].role === 'user') { lastUserIdx = i; break; } }
+  if (lastUserIdx < 0) throw new Error('缺少用户消息，无法发送语音');
+  const lastText = String(msgs[lastUserIdx].content || '').slice(0, 2000);
+  msgs[lastUserIdx] = {
+    role: 'user',
+    content: [
+      { type: 'input_audio', input_audio: { data: audioDataUri, format: 'wav' } },
+      { type: 'text', text: (lastText ? (lastText + '\n') : '') + AUDIO_LISTEN_HINT }
+    ]
+  };
+  const body = {
+    model: model,
+    messages: msgs,
+    modalities: ['text'],                 // 只回文字；语音仍由免费 Edge TTS 朗读（省钱且音质统一）
+    stream: true,                         // Omni 硬性要求：stream 必须为 true，否则报错
+    stream_options: { include_usage: true }
+  };
+  let r;
+  try {
+    r = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
+      method: 'POST',
+      signal: AbortSignal.timeout(60000), // 音频理解比纯文本慢，放宽到 60s
+      headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  } catch (netErr) {
+    tried.push(model);
+    return chatOmniAudio(messages, audioDataUri, tried);
+  }
+  const ct = r.headers.get('content-type') || '';
+  if (ct.includes('text/event-stream') || ct.includes('stream')) {
+    const out = await consumeStream(r, model);
+    if (!out.sawChunk) { tried.push(model); return chatOmniAudio(messages, audioDataUri, tried); }
+    return out;
+  }
+  const j = await r.json().catch(() => ({}));
+  if (j.error) {
+    const code = j.error.code || (j.error.type) || '';
+    const msg = j.error.message || JSON.stringify(j.error);
+    if (isModelFatal(code, msg)) { tried.push(model); return chatOmniAudio(messages, audioDataUri, tried); }
+    throw new Error('语音模型调用失败[' + code + ']：' + msg);
+  }
+  const content = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
+  return { text: String(content).trim(), model: model, usage: j.usage || null };
 }
 
 /* ---------- 整句 TTS：复用 DashScope key，合成整句英文（有道 dictvoice 不支持整句）---------- */
@@ -1035,6 +1133,37 @@ app.post('/chat', express.json({ limit: '60kb' }), async (req, res) => {
   }
 });
 
+/* ---------- 语音直连端点：孩子的原始音频 + 多轮 messages → Omni 音频模型 ----------
+ * 与 /chat 的区别：/chat 只收文字（孩子的语音早已被 ASR 转成文字，模型听不到声音）；
+ * /chat-audio 把「这一轮的原始音频」一并交给音频大模型，模型真正听到孩子的发音后再回应。
+ * 前端策略是双路并行：ASR 照跑（用于显示孩子原话气泡 + 历史上下文），音频同时发这里；
+ * 本端点一旦失败（额度耗尽/模型下线/网络），前端自动回退 /chat 文字链路，聊天不中断。
+ */
+app.post('/chat-audio', upload.single('audio'), async (req, res) => {
+  if (!API_KEY) return res.status(400).json({ error: 'no-key', message: '未配置 API_KEY，无法使用语音直连（请在 .env 配置 DashScope key）' });
+  if (!req.file || !req.file.buffer || !req.file.buffer.length) return res.status(400).json({ error: 'no-audio', message: '未收到音频' });
+  if (req.file.buffer.length > 10 * 1024 * 1024) return res.status(413).json({ error: 'too-large', message: '音频过大（>10MB），请说短一点' });
+  let messages = [];
+  try { messages = JSON.parse(req.body.messages || '[]'); } catch (_) { messages = []; }
+  if (!Array.isArray(messages) || !messages.length) return res.status(400).json({ error: 'empty', message: 'messages 为空' });
+  // 轻量把关：限制角色、条数与长度（与 /chat 保持一致）
+  const clean = messages.slice(-24).map(m => ({
+    role: (m.role === 'system' || m.role === 'user' || m.role === 'assistant') ? m.role : 'user',
+    content: String(m.content || '').slice(0, 2000)
+  })).filter(m => m.content);
+  if (!clean.length) return res.status(400).json({ error: 'empty', message: '有效消息为空' });
+  const dataUri = 'data:audio/wav;base64,' + req.file.buffer.toString('base64');
+  try {
+    const out = await chatOmniAudio(clean, dataUri);
+    if (!out || !out.text) return res.status(502).json({ error: 'empty-reply', message: 'AI 未返回内容，请重试' });
+    try { recordUsage(out.model, out.usage, true); } catch (_) {}
+    res.json({ ok: true, reply: out.text, model: out.model });
+  } catch (e) {
+    // 明确的失败码：前端据此自动回退到「ASR 文字 → /chat」链路
+    res.status(502).json({ error: 'audio-chat-failed', message: e.message || String(e) });
+  }
+});
+
 /* 用量看板：各模型本月已用 tokens、状态、预计还能练几天 */
 app.get('/chat-usage', (req, res) => {
   const u = loadUsage();
@@ -1085,6 +1214,18 @@ app.get('/chat-usage', (req, res) => {
       if (s.total > 0 && dayOfMonth > 0) perDay = s.total / dayOfMonth;
       const canDays = perDay > 0 ? Math.floor(remain / perDay) : 9999;
       return mk('AI 对话陪练（自动降级池）', m, '阿里云百炼', 'flash 系列免费额度，自动切换（以控制台为准）', m, {
+        remain, status: used >= FREE_PER_MODEL ? 'exhausted' : 'ok',
+        canDays: canDays > 365 ? '>1年' : (canDays + ' 天')
+      });
+    }),
+    ...ACTIVE_AUDIO_MODELS.map(m => {
+      const s = u.perModel[m] || {};
+      const used = s.total || 0;
+      const remain = Math.max(0, FREE_PER_MODEL - used);
+      let perDay = 0;
+      if (s.total > 0 && dayOfMonth > 0) perDay = s.total / dayOfMonth;
+      const canDays = perDay > 0 ? Math.floor(remain / perDay) : 9999;
+      return mk('语音直连（AI 直接听声音）', m, '阿里云百炼', '音频大模型免费额度，自动切换（以控制台为准）', m, {
         remain, status: used >= FREE_PER_MODEL ? 'exhausted' : 'ok',
         canDays: canDays > 365 ? '>1年' : (canDays + ' 天')
       });
