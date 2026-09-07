@@ -1432,6 +1432,10 @@ if (WS_AVAILABLE) {
         signalBroadcast(room, { type:'topic', from: ws._peerId, name: (room.members.get(ws._peerId)||{}).name, topic: String(msg.topic||'').slice(0,200) }, ws._peerId);
         return;
       }
+      if (msg.type === 'subtitle') {
+        signalBroadcast(room, { type:'subtitle', from: ws._peerId, name: (room.members.get(ws._peerId)||{}).name, text: String(msg.text||'').slice(0,400), final: !!msg.final }, ws._peerId);
+        return;
+      }
       if (msg.type === 'bye') { leaveSignal(ws); return; }
     });
     ws.on('close', () => leaveSignal(ws));
