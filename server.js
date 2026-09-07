@@ -1274,13 +1274,14 @@ app.use((err, req, res, next) => {
  * 前端负责组装协议（run-task / 二进制 PCM / finish-task），本服务只透传字节。
  */
 const server = http.createServer(app);
+let asrWss = null, signalWss = null;
 if (WS_AVAILABLE) {
   // 每条客户端连接对应一条“浏览器→本服务→DashScope”的透传隧道。
   // 不用“启动预热连接池”：空闲连接易被 DashScope 静默关闭而 Node 未察觉（readyState 仍 OPEN），
   // 导致 run-task 发到死连接、永远收不到 task-started。每次新建上游连接虽多一次握手，
   // 但与“浏览器→后端”握手并行，实际延迟可接受且稳定可靠。
-  const wss = new WebSocketServer({ server, path: '/asr-realtime' });
-  wss.on('connection', (client) => {
+  asrWss = new WebSocketServer({ noServer: true });
+  asrWss.on('connection', (client) => {
     console.log('[RT] 客户端已连接（workspace=' + RT_WORKSPACE + '）');
     let upstream = null, upOpen = false, pending = [];
 
@@ -1362,9 +1363,106 @@ if (WS_AVAILABLE) {
   console.warn('[RT] /asr-realtime 未启用（ws 模块缺失）。');
 }
 
+/* ---------- 同学连线：WebRTC 信令服务（仅做握手转发，语音走 P2P 直连，服务器零带宽成本） ----------
+ * 房间为临时内存态：刷新/全部离开即失效，不落库、不存储任何对话录音或文字（符合“不长期保存”原则）。
+ * pair 模式上限 2 人，group 模式上限 4 人（mesh 拓扑上限，超过需 SFU 服务器，违背“免费”原则故不支持）。
+ */
+const SIGNAL_MAX = 4;
+const signalRooms = new Map(); // code -> { code, mode, max, createdAt, members: Map(peerId -> {ws, name}) }
+function genRoomCode(){
+  const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去除易混淆 0/O/1/I
+  let c;
+  do { c=''; for(let i=0;i<6;i++) c+=chars[Math.floor(Math.random()*chars.length)]; }
+  while(signalRooms.has(c));
+  return c;
+}
+function sendJson(ws, obj){ try{ if(ws && ws.readyState===1) ws.send(JSON.stringify(obj)); }catch(_){} }
+function signalBroadcast(room, obj, exceptId){
+  if(!room) return;
+  room.members.forEach((m, id)=>{ if(id!==exceptId) sendJson(m.ws, obj); });
+}
+function leaveSignal(ws){
+  const r = ws._room; if(!r) return;
+  const id = ws._peerId;
+  if(r.members.has(id)) r.members.delete(id);
+  signalBroadcast(r, { type:'peer-left', id }, id);
+  if(r.members.size===0) signalRooms.delete(r.code);
+  ws._room = null;
+}
+
+if (WS_AVAILABLE) {
+  signalWss = new WebSocketServer({ noServer: true });
+  signalWss.on('connection', (ws) => {
+    ws._peerId = crypto.randomBytes(6).toString('hex');
+    ws._room = null;
+    ws.on('message', (raw) => {
+      let msg; try { msg = JSON.parse(raw.toString()); } catch(_){ return; }
+      if(!msg || typeof msg.type !== 'string') return;
+      const room = ws._room;
+
+      if (msg.type === 'hello') {
+        // hello: { room?, name?, mode? }  room 空=创建；非空=加入
+        let code = (msg.room || '').toString().trim().toUpperCase();
+        let name = (msg.name || '同学').toString().trim().slice(0, 16) || '同学';
+        let mode = (msg.mode === 'group') ? 'group' : 'pair';
+        let r = code ? signalRooms.get(code) : null;
+        if (code && !r) { sendJson(ws, { type:'error', msg:'房间不存在或已失效，请确认邀请码' }); return; }
+        if (!r) {
+          r = { code: genRoomCode(), mode, max: (mode==='group'?SIGNAL_MAX:2), createdAt: Date.now(), members: new Map() };
+          signalRooms.set(r.code, r);
+        }
+        if (r.members.size >= r.max) { sendJson(ws, { type:'room-full', max: r.max }); return; }
+        r.members.set(ws._peerId, { ws, name });
+        ws._room = r;
+        const peers = [];
+        r.members.forEach((m, id) => { if(id !== ws._peerId) peers.push({ id, name: m.name }); });
+        sendJson(ws, { type:'welcome', you: ws._peerId, room: r.code, mode: r.mode, max: r.max, peers });
+        signalBroadcast(r, { type:'peer-joined', id: ws._peerId, name }, ws._peerId);
+        return;
+      }
+
+      if (!room) return; // 未加入房间，丢弃后续消息
+
+      if (msg.type === 'offer' || msg.type === 'answer' || msg.type === 'ice') {
+        const target = room.members.get(msg.to);
+        if (target) sendJson(target.ws, { type: msg.type, from: ws._peerId, sdp: msg.sdp, candidate: msg.candidate });
+        return;
+      }
+      if (msg.type === 'topic') {
+        signalBroadcast(room, { type:'topic', from: ws._peerId, name: (room.members.get(ws._peerId)||{}).name, topic: String(msg.topic||'').slice(0,200) }, ws._peerId);
+        return;
+      }
+      if (msg.type === 'bye') { leaveSignal(ws); return; }
+    });
+    ws.on('close', () => leaveSignal(ws));
+    ws.on('error', () => {});
+  });
+  console.log('[SIGNAL] 同学连线信令服务已启用，路径 /signal，pair≤2 人 / group≤' + SIGNAL_MAX + ' 人');
+} else {
+  console.warn('[SIGNAL] 同学连线信令未启用（ws 模块缺失）。');
+}
+
+// 统一 upgrade 路由：两个 WebSocket 服务共用同一 http.Server，
+// 必须由这里按路径分发——否则 ws 库会对“非本服务路径”的请求直接 abortHandshake(400)，
+// 导致 /signal 等其它路径永远连不上。
+if (WS_AVAILABLE) {
+  server.on('upgrade', (req, socket, head) => {
+    const p = (req.url || '').split('?')[0];
+    if (p === '/asr-realtime' && asrWss) {
+      asrWss.handleUpgrade(req, socket, head, (ws) => asrWss.emit('connection', ws, req));
+      return;
+    }
+    if (p === '/signal' && signalWss) {
+      signalWss.handleUpgrade(req, socket, head, (ws) => signalWss.emit('connection', ws, req));
+      return;
+    }
+    socket.destroy();
+  });
+}
+
 if (require.main === module) {
   server.listen(PORT, () => {
-    console.log('[加贝后端] 已启动 http://localhost:' + PORT + '  key=' + (API_KEY ? '已配置' : '未配置') + ' vision=' + VISION_PROVIDER + ' asr=' + ASR_PROVIDER + ' realtime-ws=/asr-realtime');
+    console.log('[加贝后端] 已启动 http://localhost:' + PORT + '  key=' + (API_KEY ? '已配置' : '未配置') + ' vision=' + VISION_PROVIDER + ' asr=' + ASR_PROVIDER + ' realtime-ws=/asr-realtime signal=/signal');
   });
 }
 
