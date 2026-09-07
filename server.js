@@ -1164,6 +1164,59 @@ app.post('/chat-audio', upload.single('audio'), async (req, res) => {
   }
 });
 
+/* ---------- 同学连线 · M3：AI 私教旁听 + 对话小报告 ----------
+ * /connect-coach：根据房间内已收集的对话实录，让 AI 私教生成一句简短中文点评/纠正，
+ *   并广播给房间所有人（含请求者之外的其他成员），实现“旁听中适时点拨”。
+ * /connect-report：根据对话实录生成一份可打印的 HTML 小报告（概况+实录+点评+复习词句+给家长的话）。
+ * 两者均复用 chatQwen（免费 qwen 模型池），失败 gracefully 返回友好文本，不抛 500。
+ */
+function roomByCode(code){
+  if(typeof code!=='string') return null;
+  const c = code.trim().toUpperCase();
+  return (typeof signalRooms!=='undefined' && signalRooms.get(c)) || null;
+}
+app.post('/connect-coach', express.json({ limit: '32kb' }), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const lines = Array.isArray(body.transcript) ? body.transcript.slice(-40) : [];
+    if (!lines.length) return res.json({ text: '先聊几句，我再帮你点评哦～' });
+    const convo = lines.map(l => ((l.name ? (l.name + '：') : '')) + (l.text || '')).join('\n');
+    const sys = '你是「Jiabei 顶级英语口语私教」，正在用中文旁听两个中国小学生的英语对话。'
+      + '请根据下面这段对话实录，给出一句简短、温暖、鼓励性的点评或纠正：①若发现明显错误，用温和方式指出并给正确说法；'
+      + '②若对话顺畅，就鼓励并抛一个能延续对话的小问题；③控制在 50 字以内；④全程用中文，可夹少量英文例子。'
+      + '只输出这一句话，不要解释、不要加引号。';
+    const r = await chatQwen([{ role:'system', content: sys }, { role:'user', content: '对话实录：\n' + convo }]);
+    const text = ((r && r.text) ? r.text : '').trim() || '说得不错，继续加油！';
+    const rm = roomByCode(body.room);
+    if (rm) signalBroadcast(rm, { type:'coach', name:'Jiabei 私教', text }, body.from || null);
+    res.json({ text });
+  } catch (e) {
+    res.status(200).json({ text: '私教暂时走神了，稍后再点「私教点评」试试～' });
+  }
+});
+app.post('/connect-report', express.json({ limit: '48kb' }), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const lines = Array.isArray(body.transcript) ? body.transcript.slice(-80) : [];
+    const names = (Array.isArray(body.participants) && body.participants.length) ? body.participants.join('、') : '小朋友';
+    const dur = Math.max(0, Math.round(Number(body.durationSec) || 0));
+    const convo = lines.length ? lines.map(l => ((l.name ? (l.name + '：') : '')) + (l.text || '')).join('\n')
+                                : '（本次没有识别到对话内容）';
+    const sys = '你是「Jiabei 顶级英语口语私教」，请根据下面两个中国小学生的英语对话实录，生成一份面向孩子的「对话小报告」（用于家长查看和孩子回顾）。'
+      + '请用简洁的中文、清晰的版式（用 <h2>/<h3>/<ul>/<li>/<p> 等普通 HTML 标签，不要写内联 style 以外的复杂样式），包含：'
+      + '1.对话概况：参与者、时长、大约几轮。2.对话实录：按发言者列出（<ul><li><b>名字：</b>内容</li></ul>）。'
+      + '3.私教点评：孩子说得好的地方（鼓励为主），以及 1-3 条可改进的小建议。'
+      + '4.值得复习的词句：列出 3-5 个对话里出现、值得巩固的英文单词/短语及中文意思。'
+      + '5.给家长的话：一句如何陪孩子练习的建议。全程用中文，语气亲切、积极、具体。只输出 HTML 片段（从 <h2> 开始，不要 <html>/<body>）。';
+    const user = '参与者：' + names + '\n时长（秒）：' + dur + '\n对话实录：\n' + convo;
+    const r = await chatQwen([{ role:'system', content: sys }, { role:'user', content: user }]);
+    const html = ((r && r.text) ? r.text : '').trim() || '<h2>对话小报告</h2><p>本次没有识别到对话内容，下次记得打开「实时字幕」再聊哦～</p>';
+    res.json({ html });
+  } catch (e) {
+    res.status(200).json({ html: '<h2>对话小报告</h2><p>生成报告时出了点小问题，请稍后重试。</p>' });
+  }
+});
+
 /* 用量看板：各模型本月已用 tokens、状态、预计还能练几天 */
 app.get('/chat-usage', (req, res) => {
   const u = loadUsage();
