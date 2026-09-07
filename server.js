@@ -1418,10 +1418,12 @@ if (WS_AVAILABLE) {
 
 /* ---------- 同学连线：WebRTC 信令服务（仅做握手转发，语音走 P2P 直连，服务器零带宽成本） ----------
  * 房间为临时内存态：刷新/全部离开即失效，不落库、不存储任何对话录音或文字（符合“不长期保存”原则）。
+ * 支持可选口令（pwd）：固定小组房间可设口令，加入时需匹配；临时房间 pwd 为空即免口令。
+ * 心跳保活：前端每 15s 发 hb，后端 45s 无活动即清理幽灵成员（断线未发 bye 的情况）。
  * pair 模式上限 2 人，group 模式上限 4 人（mesh 拓扑上限，超过需 SFU 服务器，违背“免费”原则故不支持）。
  */
 const SIGNAL_MAX = 4;
-const signalRooms = new Map(); // code -> { code, mode, max, createdAt, members: Map(peerId -> {ws, name}) }
+const signalRooms = new Map(); // code -> { code, mode, max, pwd, createdAt, members: Map(peerId -> {ws, name, lastSeen}) }
 function genRoomCode(){
   const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去除易混淆 0/O/1/I
   let c;
@@ -1454,18 +1456,26 @@ if (WS_AVAILABLE) {
       const room = ws._room;
 
       if (msg.type === 'hello') {
-        // hello: { room?, name?, mode? }  room 空=创建；非空=加入
+        // hello: { room?, name?, mode?, pwd? }
+        //   room 空            → 创建新房（pwd 空 = 临时房间，免口令）
+        //   room 非空 && 已存在 → 加入；若房间设了 pwd 则需匹配，否则报错
+        //   room 非空 && 不存在 → 仅当带了 pwd（固定小组首次有人进房）时按该 pwd 创建；否则提示房间不存在
         let code = (msg.room || '').toString().trim().toUpperCase();
         let name = (msg.name || '同学').toString().trim().slice(0, 16) || '同学';
         let mode = (msg.mode === 'group') ? 'group' : 'pair';
+        const pwd = (msg.pwd || '').toString();
         let r = code ? signalRooms.get(code) : null;
-        if (code && !r) { sendJson(ws, { type:'error', msg:'房间不存在或已失效，请确认邀请码' }); return; }
+        if (code && r && r.pwd && r.pwd !== pwd) {
+          sendJson(ws, { type:'error', code:'pwd', msg:'口令不正确' });
+          return;
+        }
         if (!r) {
-          r = { code: genRoomCode(), mode, max: (mode==='group'?SIGNAL_MAX:2), createdAt: Date.now(), members: new Map() };
+          if (code && !pwd) { sendJson(ws, { type:'error', msg:'房间不存在或已失效，请确认邀请码' }); return; }
+          r = { code: code || genRoomCode(), mode, max: (mode==='group'?SIGNAL_MAX:2), pwd: pwd||'', createdAt: Date.now(), members: new Map() };
           signalRooms.set(r.code, r);
         }
         if (r.members.size >= r.max) { sendJson(ws, { type:'room-full', max: r.max }); return; }
-        r.members.set(ws._peerId, { ws, name });
+        r.members.set(ws._peerId, { ws, name, lastSeen: Date.now() });
         ws._room = r;
         const peers = [];
         r.members.forEach((m, id) => { if(id !== ws._peerId) peers.push({ id, name: m.name }); });
@@ -1475,6 +1485,9 @@ if (WS_AVAILABLE) {
       }
 
       if (!room) return; // 未加入房间，丢弃后续消息
+      const _mem = room.members.get(ws._peerId); if (_mem) _mem.lastSeen = Date.now(); // 心跳保活：任意消息即刷新活跃时间
+
+      if (msg.type === 'hb') { return; } // 显式心跳：已在上面刷新过 lastSeen, 无需动作
 
       if (msg.type === 'offer' || msg.type === 'answer' || msg.type === 'ice') {
         const target = room.members.get(msg.to);
@@ -1494,6 +1507,23 @@ if (WS_AVAILABLE) {
     ws.on('close', () => leaveSignal(ws));
     ws.on('error', () => {});
   });
+
+  // 心跳清理：定期踢出超过 45s 无任何活动（含心跳）的“幽灵”成员（多为断网/切后台未正常发 bye 的连接），
+  // 避免其一直占着名额导致别人加不进；房间空了即删除。配合前端每 15s 一次 hb 心跳。
+  setInterval(() => {
+    const now = Date.now();
+    signalRooms.forEach((r, code) => {
+      r.members.forEach((m, id) => {
+        if (now - (m.lastSeen || 0) > 45000) {
+          try { m.ws.close(); } catch(_) {}
+          r.members.delete(id);
+          signalBroadcast(r, { type:'peer-left', id }, id);
+        }
+      });
+      if (r.members.size === 0) signalRooms.delete(code);
+    });
+  }, 15000);
+
   console.log('[SIGNAL] 同学连线信令服务已启用，路径 /signal，pair≤2 人 / group≤' + SIGNAL_MAX + ' 人');
 } else {
   console.warn('[SIGNAL] 同学连线信令未启用（ws 模块缺失）。');
