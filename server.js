@@ -1133,6 +1133,47 @@ app.post('/chat', express.json({ limit: '60kb' }), async (req, res) => {
   }
 });
 
+/* ---------- AI 出卷：异步 /chat 任务（绕开 Render 25–30s 同步代理超时）----------
+ * 与 /chat 参数完全相同，但立刻返回 taskId；前端轮询 /chat-task/status/:id 取结果。
+ * 生成整份综合卷可能 30–90 秒，同步接口会被 Render 掐断，故必须异步。
+ */
+app.post('/chat-task', express.json({ limit: '200kb' }), (req, res) => {
+  if (!API_KEY) return res.status(400).json({ error: 'no-key', message: '未配置 API_KEY，无法使用 AI 出卷（请在 .env 配置 DashScope key）' });
+  const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+  if (!messages.length) return res.status(400).json({ error: 'empty', message: 'messages 为空' });
+  const clean = messages.slice(-40).map(m => ({
+    role: (m.role === 'system' || m.role === 'user' || m.role === 'assistant') ? m.role : 'user',
+    content: String(m.content || '').slice(0, 4000)
+  })).filter(m => m.content);
+  if (!clean.length) return res.status(400).json({ error: 'empty', message: '有效消息为空' });
+  const id = newTask();
+  (async () => {
+    try {
+      const out = await chatQwen(clean);
+      if (!out || !out.text) {
+        finishTask(id, { status: 'error', error: 'AI 未返回内容，请重试' });
+        return;
+      }
+      try { recordUsage(out.model, out.usage, true); } catch (_) {}
+      finishTask(id, { status: 'done', reply: out.text, model: out.model });
+    } catch (e) {
+      finishTask(id, { status: 'error', error: e.message || String(e) });
+    }
+  })();
+  res.status(202).json({ taskId: id, status: 'processing' });
+});
+
+app.get('/chat-task/status/:id', (req, res) => {
+  const t = tasks.get(req.params.id);
+  if (!t) return res.status(404).json({ error: '任务不存在或已过期，请重试' });
+  if (t.status === 'processing' && Date.now() - t.startedAt > 300000) {
+    tasks.delete(req.params.id);
+    return res.status(408).json({ error: 'AI 出卷超时（模型响应过慢），请稍后重试' });
+  }
+  consumeTask(req.params.id);
+  res.json(t);
+});
+
 /* ---------- 语音直连端点：孩子的原始音频 + 多轮 messages → Omni 音频模型 ----------
  * 与 /chat 的区别：/chat 只收文字（孩子的语音早已被 ASR 转成文字，模型听不到声音）；
  * /chat-audio 把「这一轮的原始音频」一并交给音频大模型，模型真正听到孩子的发音后再回应。
