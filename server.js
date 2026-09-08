@@ -514,6 +514,9 @@ app.get('/free-passage', (req, res) => {
 });
 
 /* ---------- 路由 ---------- */
+/* 轻量唤醒接口：用于 Render 免费实例冷启动时先被 ping 醒，再跑耗时任务 */
+app.get('/ping', (req, res) => { res.json({ ok: true, pong: true, t: Date.now() }); });
+
 /* 诊断接口：返回 API Key 脱敏元信息，不暴露完整 Key，用于排查「Incorrect API key」 */
 app.get('/diag', (req, res) => {
   const raw = process.env.API_KEY || process.env.DASHSCOPE_API_KEY || '';
