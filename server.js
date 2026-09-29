@@ -1065,7 +1065,7 @@ app.get('/tts-edge', async (req, res) => {
   let voice = String(req.query.voice || 'en-US-AriaNeural').slice(0, 40).trim();
   if (!_edgeVoiceRe.test(voice)) voice = 'en-US-AriaNeural';
   let rate = String(req.query.rate || '-15%').slice(0, 8).trim();
-  if (!/^-?\d{1,2}%$/.test(rate)) rate = '-15%';   // 儿童学习默认放慢 15%
+  if (!/^[+-]?\d{1,2}%$/.test(rate)) rate = '-15%';   // 儿童学习默认放慢 15%；允许 +10% / 10% / -8% 三种写法
   try {
     const buf = await edgeTTS(text, voice, rate);
     if (!buf || !buf.length) return res.status(502).json({ error: 'edge-empty', message: 'Edge TTS 未返回音频' });
@@ -1381,20 +1381,49 @@ if (WS_AVAILABLE) {
   asrWss.on('connection', (client) => {
     console.log('[RT] 客户端已连接（workspace=' + RT_WORKSPACE + '）');
     let upstream = null, upOpen = false, pending = [];
+    let upIdleAt = Date.now();     // 上游最近一次“有活干”的时刻；空闲过久即视为不可信
+    let notifiedDead = false;      // 本条任务的“上游死掉”是否已通知前端，避免重复发
+
+    // 上游最长可空闲时长：2026-09-29 实测——空闲 40s 尚可用，90s/200s 后 run-task 石沉大海
+    // （DashScope 会静默关闭长时间空闲的连接，close 事件到达前 readyState 仍可能是 OPEN）。取 45s 保守回收。
+    const RT_UPSTREAM_MAX_IDLE = 45000;
+    function upstreamUsable(){ return !!(upstream && upOpen && upstream.readyState === WebSocket.OPEN); }
+    // 关键修复：上游不可用（被静默关闭 / 空闲过久 / 尚未建立）时，必须立刻重开一条。
+    // 否则控制消息只会被塞进 pending，而 pending 仅在 upstream 'open' 时冲刷——那条连接再也不会 open，
+    // 于是 run-task 永远送不到 DashScope：前端表现为「正在聆听…」等 8 秒超时、提示“实时识别连接有点慢”，
+    // 之后每次点「说」都识别不到声音，只能刷新页面才恢复。
+    function ensureUpstream(){
+      if (upstream && upstream.readyState <= WebSocket.OPEN) {
+        if (upstream.readyState === WebSocket.OPEN && (Date.now() - upIdleAt) > RT_UPSTREAM_MAX_IDLE) {
+          console.log('[RT] 上游已空闲 ' + Math.round((Date.now() - upIdleAt) / 1000) + 's（阈值 ' + (RT_UPSTREAM_MAX_IDLE / 1000) + 's）→ 主动回收重建');
+          try { upstream._recycled = true; upstream.close(); } catch (_) {}
+          upstream = null; upOpen = false;
+        } else {
+          upOpen = upstream.readyState === WebSocket.OPEN;
+          return;
+        }
+      }
+      openUpstream();
+    }
+    function toUpstream(payload){
+      if (upstreamUsable()) { try { upstream.send(payload); return; } catch (_) {} }
+      pending.push(payload);      // 先排队，新上游 open 后会冲刷
+      ensureUpstream();
+    }
 
     function openUpstream(){
       console.log('[RT] 正在连接上游: ' + RT_WS_URL + '  workspace=' + RT_WORKSPACE);
-      upstream = new WebSocket(RT_WS_URL, {
+      const self = upstream = new WebSocket(RT_WS_URL, {
         headers: { Authorization: 'Bearer ' + API_KEY, 'user-agent': 'jiabei-backend/1.0', 'X-DashScope-WorkSpace': RT_WORKSPACE }
       });
       let gotEvent = false, watchdog = null;
       upstream.on('open', () => {
-        upOpen = true;
+        upOpen = true; upIdleAt = Date.now(); gotEvent = false; notifiedDead = false;
         console.log('[RT] 上游(DashScope)已打开（握手成功）');
-        while (pending.length) { try { upstream.send(pending.shift()); } catch (_) {} }
+        while (pending.length) { try { self.send(pending.shift()); } catch (_) {} }
       });
       upstream.on('message', (d) => {
-        gotEvent = true;
+        gotEvent = true; upIdleAt = Date.now();   // 上游有事件回来 → 不算空闲
         if (watchdog) { clearTimeout(watchdog); watchdog = null; }
         if (client.readyState !== WebSocket.OPEN) return;
         // DashScope 控制消息可能是 binary frame（内容仍是 JSON），必须转成字符串再转发，
@@ -1408,9 +1437,17 @@ if (WS_AVAILABLE) {
       });
       upstream.on('close', (code, reason) => {
         if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+        if (upstream === self) upOpen = false;   // 只有当前这条上游才有权置位，避免旧连接的 close 打断新连接
         // code 是关键诊断：1000+空 reason=正常关闭；1008/1011=策略/服务错误；
         // 若发 run-task 后一直无事件、最后被关，多半是模型/workspace 未开通实时识别。
         console.log('[RT] 上游已关闭 code=' + code + ' reason=' + (reason && reason.toString ? reason.toString() : '(空)'));
+        // 死连接主动告知：已转发 run-task 却一个事件都没回就被断开（典型＝空闲被 DashScope 静默掐断），
+        // 此时回一个 task-failed，前端会立刻走“重连重试”，不必干等 8 秒连接超时。
+        if (!self._recycled && self._runTaskSent && !gotEvent && !notifiedDead && client.readyState === WebSocket.OPEN) {
+          notifiedDead = true;
+          console.log('[RT] 上游在收到 run-task 后无任何事件即断开 → 通知前端重连');
+          try { client.send(JSON.stringify({ header: { event: 'task-failed', error_code: 'UPSTREAM_CLOSED', error_message: '实时识别连接已失效，正在重连' }, payload: {} })); } catch (_) {}
+        }
       });
       upstream.on('error', (e) => { console.error('[RT] 上游(DashScope)错误:', e && e.message || e); });
       upstream.on('unexpected-response', (req, res) => {
@@ -1440,17 +1477,21 @@ if (WS_AVAILABLE) {
       if (action === 'run-task') {
         console.log('[RT] 收到客户端 run-task，转发到上游（帧: ' + (typeof data === 'string' ? 'text' : 'binary→已转文本') + '）');
         console.log('[RT] run-task 内容: ' + (str ? str.slice(0, 500) : '[空]'));
-        if (upstream && upstream._watchdogArm) upstream._watchdogArm(6);
       }
       if (isControl) {
-        // 关键修复：控制消息一律以文本帧转发给 DashScope
+        // 关键修复①：控制消息一律以文本帧转发给 DashScope
+        // 关键修复②：通过 toUpstream 转发——上游若已被静默关闭，这里会自动重开一条再发，
+        //            而不是像原先那样只塞进 pending（pending 只在 upstream 'open' 时冲刷，永远等不到）。
         const out = (str != null) ? str : (typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data.toString('utf8') : ''));
-        if (upOpen && upstream && upstream.readyState === WebSocket.OPEN) try { upstream.send(out); } catch (_) {}
-        else pending.push(out);
+        toUpstream(out);
+        if (action === 'run-task') {
+          notifiedDead = false;                        // 新任务开始，允许重新通知“上游已死”
+          if (upstream) upstream._runTaskSent = true;  // 供 close 时判断“发了任务却一个事件都没回”
+          if (upstream && upstream._watchdogArm) upstream._watchdogArm(6);
+        }
       } else {
         // 二进制音频帧（Int16 PCM）：原样转发，保持字节不变
-        if (upOpen && upstream && upstream.readyState === WebSocket.OPEN) try { upstream.send(data); } catch (_) {}
-        else pending.push(data);
+        toUpstream(data);
       }
     });
     client.on('close', () => { try { if (upstream) upstream.close(); } catch (_) {} });
