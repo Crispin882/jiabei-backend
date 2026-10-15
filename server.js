@@ -1005,6 +1005,8 @@ app.get('/tts-edge', async (req, res) => {
     if (!buf || !buf.length) return res.status(502).json({ error: 'edge-empty', message: 'Edge TTS 未返回音频' });
     res.set('Content-Type', 'audio/mpeg');
     res.set('Cache-Control', 'public, max-age=86400');
+    // 记账：Edge 是免费服务（无 token 概念），但家长要能看到"到底用了多少次"→ 只记 calls
+    try { recordCall('Edge TTS'); } catch (_) {}
     return res.send(buf);
   } catch (e) {
     res.status(502).json({ error: 'edge-failed', message: e.message || String(e) });
@@ -1043,6 +1045,15 @@ function recordUsage(model, usage, rounded){
   m.calls += 1;
   u.perModel[model] = m;
   if (rounded) u.rounds += 1; // 仅在有真实对话轮次时计数
+  saveUsage();
+}
+// 只记调用次数、不记 tokens：给 Edge TTS / 百度 TTS 这类**完全免费、没有 token 概念**的服务用。
+// 之前它们从不记账→ 用量面板里那几行永远是 0，家长看不出"到底有没有在用"（2026-10-15 家长反馈）。
+function recordCall(model){
+  const u = loadUsage();
+  const m = u.perModel[model] || { prompt: 0, completion: 0, total: 0, calls: 0 };
+  m.calls += 1;
+  u.perModel[model] = m;
   saveUsage();
 }
 
@@ -1262,14 +1273,55 @@ app.get('/chat-usage', (req, res) => {
       });
     }),
     // ⚠️ 付费 TTS（qwen-audio）已于 2026-10-15 停用，故不再出现在用量看板里 —— 发音全走免费 Edge。
-    mk('语音合成（主用·纯正美音）', 'Edge TTS', '微软免费接口', '完全免费，无额度限制', null)
+    mk('语音合成（纯正美音）', 'Edge TTS', '微软免费接口', '完全免费，无额度限制', 'Edge TTS')
   ];
+  // ---------- 家长视角的简化清单（2026-10-15 家长反馈「每个模型用多少看不出来」后新增） ----------
+  // 家长不需要看 6 个模型代号 + tokens；他要的是三件事：①这个功能用了多少次 ②会不会扣钱 ③还够用多久。
+  // 所以：①把「对话池/语音直连池」的多模型**合并成一行**（自动切换，本质是同一笔额度）
+  //      ②每个功能显式标 `free:true/false`（是否可能产生费用）  ③顶栏给一句结论"现在要不要付钱"。
+  const sumOf = (arr) => arr.reduce((a, m) => a + ((u.perModel[m] || {}).total || 0), 0);
+  const callsOf = (arr) => arr.reduce((a, m) => a + ((u.perModel[m] || {}).calls || 0), 0);
+  const simple = [];
+  {
+    const chatCalls = callsOf(ACTIVE_CHAT_MODELS);
+    const chatUsed = sumOf(ACTIVE_CHAT_MODELS);
+    simple.push({
+      feature: 'AI 对话陪练', desc: '开口说里的 AI 陪练对话',
+      calls: chatCalls, used: chatUsed, free: true,
+      remain: Math.max(0, FREE_PER_MODEL - chatUsed),
+      canDays: chatUsed > 0 && dayOfMonth > 0
+        ? Math.max(0, Math.floor((FREE_PER_MODEL - chatUsed) / (chatUsed / dayOfMonth)))
+        : null,
+      willCharge: false, note: '免费额度内，用完前不会扣费'
+    });
+    const audioCalls = callsOf(ACTIVE_AUDIO_MODELS);
+    const audioUsed = sumOf(ACTIVE_AUDIO_MODELS);
+    simple.push({
+      feature: '语音直连', desc: 'AI 直接听孩子发音并回应',
+      calls: audioCalls, used: audioUsed, free: true,
+      remain: Math.max(0, FREE_PER_MODEL - audioUsed),
+      canDays: audioUsed > 0 && dayOfMonth > 0
+        ? Math.max(0, Math.floor((FREE_PER_MODEL - audioUsed) / (audioUsed / dayOfMonth)))
+        : null,
+      willCharge: false, note: '免费额度内，用完前不会扣费'
+    });
+    const ocrCalls = (u.perModel[VISION_MODEL] || {}).calls || 0;
+    const asrCalls = (u.perModel[ASR_MODEL] || {}).calls || 0;
+    const rtCalls = (u.perModel['paraformer-realtime-v2'] || {}).calls || 0;
+    simple.push({ feature: '拍照识别', desc: '拍单词页/课本自动出题', calls: ocrCalls, used: 0, free: true, willCharge: false, note: '免费额度内，用完前不会扣费' });
+    simple.push({ feature: '语音识别', desc: '录音跟读与开口说的识别', calls: asrCalls + rtCalls, used: 0, free: true, willCharge: false, note: '免费额度内，用完前不会扣费' });
+    const edgeCalls = (u.perModel['Edge TTS'] || {}).calls || 0;
+    simple.push({ feature: '朗读发音', desc: '所有听/跟读的声音', calls: edgeCalls, used: 0, free: true, willCharge: false, note: '完全免费（微软+百度，不限量）' });
+  }
   res.json({
     month: u.monthKey,
     rounds: u.rounds || 0,
     freePerModel: FREE_PER_MODEL,
     models: models,
     all: all,
+    simple: simple,
+    // 顶栏结论：只要没有任何一项 willCharge，就是"现在不会扣钱"
+    allFree: simple.every(s => !s.willCharge),
     consoleUrl: 'https://bailian.console.aliyun.com/',
     note: '免费额度的真实总量/剩余只能在百炼控制台查看（无公开 API），表中「剩余/还能练」为本地累计+保守估算；已下线或即将下线的模型已从调用池剔除。'
   });
