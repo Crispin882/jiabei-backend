@@ -16,6 +16,7 @@ const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
+const os = require('os');
 // 实时语音识别依赖 ws；若未安装，主服务仍正常启动，仅 /asr-realtime 不可用（避免整个进程崩溃导致部署失败）
 let WebSocketServer = null, WebSocket = null, WS_AVAILABLE = false;
 try {
@@ -658,7 +659,8 @@ app.get('/asr/status/:id', (req, res) => {
  * 因此后端内置 CHAT_MODELS 降级列表：按序尝试，遇到模型下线/额度耗尽/不可用等错误自动跳下一个，
  * 调用方无需改代码。新增/替换模型只改下面这个数组即可（顺序=优先级）。
  * 备注（2026-08 核实）：qwen-turbo 已确认 2026-10-10 下线 → 主力改 qwen3.6-flash（长期在架、免费、超快）。
- * 另：paraformer ASR 系列亦于 2026-10-10 下线，需迁 paraformer-realtime-v2 等，属 ASR 改动，不在本段范围。
+ * ASR 说明（2026-10-15 家长与阿里云客服二次确认）：paraformer-v2 **并未下线**，批量识别功能可正常使用，
+ *   故下方模型表把 paraformer-v2 标为 sunset 属误判，已改回 stable。此前"批量识别报识别失败"的排查方向应作废。
  */
 // 对话模型降级池（顺序=优先级）。可经环境变量 CHAT_MODEL 覆盖首选项；CHAT_MODELS 覆盖整个池。
 // 2026-08 官方核实（含下线公告 notice 2009/118434/117861 + 官方计费页 2712341）：
@@ -692,7 +694,7 @@ const MODEL_LIFECYCLE = {
   'qwq-plus':                { status: 'sunset',  note: '即将下线（2026-10-10）' },
   'qwen-vl-max':             { status: 'sunset',  note: '即将下线（2026-10-10），用 qwen3-vl-plus' },
   'qwen-vl-plus':            { status: 'sunset',  note: '即将下线（2026-10-10），用 qwen3-vl-plus' },
-  'paraformer-v2':           { status: 'sunset',  note: '即将下线（2026-10-10），建议迁 paraformer-realtime-v2' },
+  'paraformer-v2':           { status: 'stable',  note: '批量识别主力（2026-10-15 家长与客服确认未下线，功能正常）' },
   'qwen3.6-max':             { status: 'sunset',  note: '即将下线（2026-10-10）' },
   'qwen3.6-max-preview':     { status: 'sunset',  note: '即将下线（2026-10-10）' },
   'qwen3.7-plus':            { status: 'stable',  note: '主力·最新中端·100万免费' },
@@ -970,82 +972,47 @@ app.get('/tts', async (req, res) => {
 });
 
 /* ---------- 免费 Edge TTS（零 key · 纯正美式 neural 音色 · 各设备一致） ----------
- * 复用 Microsoft Edge 在线 TTS（与 Edge 浏览器“大声朗读”同源），无需任何 API Key、零成本。
- * 通过 WebSocket 直连 speech.platform.bing.com，带 Sec-MS-GEC 时间戳签名（版本跟随当前 Edge）。
- * 前端“整句朗读/听”优先走此端点；华为/安卓本机 speechSynthesis 常静音，此方案用 <audio> 播放 MP3，全设备可用。
- * 注意：TRUSTED_CLIENT_TOKEN 与 GEC 算法均来自公开 edge-tts 项目，仅作免费语音合成用途。
+ * 复用 Microsoft Edge 在线 TTS（与 Edge 浏览器"大声朗读"同源），无需任何 API Key、零成本。
+ * 前端"整句朗读/听"优先走此端点；华为/安卓本机 speechSynthesis 常静音，此方案用 <audio> 播放 MP3，全设备可用。
+ *
+ * ⚠️ 2026-10-15 重大修复（家长报"播放无声/跳句/停止不住"）：
+ *   旧实现自己手搓 WebSocket 握手 + Sec-MS-GEC 签名，一度可用，但微软在 edge-tts 7.x
+ *   把 GEC 升级为 **v2**（不再是单纯 SHA256(ticks+token)，而是 CS64 + 魔改 SHA-256 的复合摘要，
+ *   且版本号从 "1-<chrome>" 改为 "2-<chrome>"）。旧签名因此一律被拒 → /tts-edge 返回 502 + 403，
+ *   前端整条发音链只剩有道可用（于是每句白等 → 没声音却跳句 / 迟到音频乱播 / 停止拦不住）。
+ *   实测：node `ws` 手搓 v1、浏览器原生 WS、多种 Sec-MS-GEC-Version 全部 403；
+ *   而同一 token 的 voices/list 返回 200（证明 token 有效、时钟同步），故根因是签名算法过期。
+ *   修法：**改用社区活跃维护的 node-edge-tts**（已实测出声：en-US/GB/zh-CN 多音色 OK），
+ *   由它自动跟随微软的 GEC 轮换，不再自己维护签名算法。
  */
-const EDGE_TRUSTED = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
-const EDGE_GEC_VERSION = '1-143.0.3650.75';
-const EDGE_CHROME = '143';
-
-function edgeSecMsGec() {
-  let ticks = Math.floor(Date.now() / 1000);
-  ticks += 11644473600;            // Windows 纪元(1601)偏移
-  ticks -= ticks % 300;            // 向下取整到 5 分钟窗口（与服务端对齐）
-  ticks *= 10000000;               // 100 纳秒间隔
-  return crypto.createHash('sha256').update(String(ticks) + EDGE_TRUSTED).digest('hex').toUpperCase();
+let EdgeTTSLib = null;
+try { EdgeTTSLib = require('node-edge-tts'); } catch (_) {}
+const EDGE_AVAILABLE = !!(EdgeTTSLib && EdgeTTSLib.EdgeTTS);
+if (!EDGE_AVAILABLE) {
+  console.warn('[EDGE] node-edge-tts 未安装，/tts-edge 将返回 503（请执行 npm install node-edge-tts 后重新部署）');
 }
-function edgeDateStr() {
-  const d = new Date();
-  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  const mos = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const p = n => String(n).padStart(2, '0');
-  return `${days[d.getUTCDay()]} ${mos[d.getUTCMonth()]} ${p(d.getUTCDate())} ${d.getUTCFullYear()} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} GMT+0000 (Coordinated Universal Time)`;
-}
-const _edgeVoiceRe = /^[a-z]{2}-[A-Z]{2}-[A-Za-z]+(Neural|Class)$/;
+const _edgeVoiceRe = /^[a-z]{2}-[A-Z]{2}-[A-Za-z]+(Neural|Class|MultilingualNeural)$/;
 
-function edgeTTS(text, voice, rate) {
+// 用 node-edge-tts 合成整句，返回 mp3 Buffer
+async function edgeTTS(text, voice, rate) {
+  if (!EDGE_AVAILABLE) throw new Error('node-edge-tts 未安装');
   rate = rate || '-15%';   // 默认放慢 15%：孩子听英语需要更慢的语速（可通过 ?rate= 覆盖）
-  return new Promise((resolve, reject) => {
-    const uid = () => crypto.randomUUID().replace(/-/g, '');
-    const safe = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const url = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${EDGE_TRUSTED}&ConnectionId=${uid()}&Sec-MS-GEC=${edgeSecMsGec()}&Sec-MS-GEC-Version=${EDGE_GEC_VERSION}`;
-    const ws = new WebSocket(url, {
-      headers: {
-        'Pragma': 'no-cache',
-        'Cache-Control': 'no-cache',
-        'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
-        'User-Agent': `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${EDGE_CHROME}.0.0.0 Safari/537.36 Edg/${EDGE_CHROME}.0.0.0`,
-        'Accept-Encoding': 'gzip, deflate, br, zstd',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cookie': `muid=${crypto.randomBytes(16).toString('hex').toUpperCase()};`
-      }
+  const tmp = path.join(os.tmpdir(), 'jiabei_edge_' + process.pid + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.mp3');
+  try {
+    const tts = new EdgeTTSLib.EdgeTTS({
+      voice: voice,
+      lang: String(voice).slice(0, 5),
+      outputFormat: 'audio-24khz-48kbitrate-mono-mp3',
+      rate: rate,
+      pitch: '+0Hz',
+      volume: '+0%'
     });
-    const audio = [];
-    let settled = false; let _msgN = 0, _binN = 0;
-    const done = (err, buf) => {
-      if (settled) return; settled = true;
-      console.error('[EDGE] done err=' + (err && err.message) + ' audioBytes=' + (buf ? buf.length : 0) + ' msgs=' + _msgN + ' bins=' + _binN);
-      clearTimeout(timer);
-      try { ws.close(); } catch (_) {}
-      if (err) reject(err); else resolve(buf);
-    };
-    const timer = setTimeout(() => done(new Error('Edge TTS 超时')), 30000);
-    ws.on('error', e => done(e));
-    ws.on('message', (raw, isBinary) => {
-      if (!isBinary) {
-        _msgN++;
-        const s = raw.toString('utf8');
-        if (s.includes('turn.end')) done(null, Buffer.concat(audio));
-        return;
-      }
-      _binN++;
-      const sep = 'Path:audio\r\n';
-      const i = raw.indexOf(sep);
-      if (i >= 0) audio.push(raw.subarray(i + sep.length));
-      else console.error('[EDGE] bin frame without Path:audio, len=' + raw.length);
-    });
-    ws.on('open', () => {
-      const cfg = `X-Timestamp:${edgeDateStr()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n`;
-      ws.send(cfg, { compress: true }, (e) => {
-        if (e) return done(e);
-        const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='${voice}'><prosody pitch='+0Hz' rate='${rate}' volume='+0%'>${safe}</prosody></voice></speak>`;
-        const msg = `X-RequestId:${uid()}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${edgeDateStr()}Z\r\nPath:ssml\r\n\r\n${ssml}`;
-        ws.send(msg, { compress: true }, (e2) => { if (e2) done(e2); });
-      });
-    });
-  });
+    await tts.ttsPromise(String(text), tmp);
+    const buf = fs.readFileSync(tmp);
+    return buf;
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (_) {}   // 无论成败都清临时文件，避免 /tmp 堆积
+  }
 }
 
 /* 免费 Edge TTS 端点（零 key）。前端整句朗读/听优先调用此端点。 */
@@ -1057,7 +1024,7 @@ function edgeRateOk(ip) {
   arr.push(now); _edgeRate.set(ip, arr); return true;
 }
 app.get('/tts-edge', async (req, res) => {
-  if (!WS_AVAILABLE) return res.status(503).json({ error: 'edge-tts-unavailable', message: '后端未加载 ws 模块，无法使用 Edge TTS（请执行 npm install ws 后重新部署）' });
+  if (!EDGE_AVAILABLE) return res.status(503).json({ error: 'edge-tts-unavailable', message: '后端未安装 node-edge-tts，无法使用 Edge TTS（请执行 npm install node-edge-tts 后重新部署）' });
   const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '');
   if (!edgeRateOk(ip)) return res.status(429).json({ error: 'rate-limited', message: '请求过于频繁，请稍后再试' });
   const text = String(req.query.text || '').slice(0, 500).trim();
@@ -1301,7 +1268,7 @@ app.get('/chat-usage', (req, res) => {
   const all = [
     mk('拍照识别（OCR 视觉）', VISION_PROVIDER === 'doubao' ? (ARK_ENDPOINT || 'doubao') : VISION_MODEL,
        VISION_PROVIDER === 'doubao' ? '火山方舟' : '阿里云百炼', '百炼免费额度内（以控制台为准）', VISION_MODEL),
-    mk('语音识别（批量录音）', ASR_MODEL, '阿里云百炼', '批量兜底路径；即将下线则建议改用实时识别', ASR_MODEL),
+    mk('语音识别（批量录音）', ASR_MODEL, '阿里云百炼', '批量兜底路径；已确认 paraformer-v2 在架可用', ASR_MODEL),
     mk('语音识别（实时边说边出字）', 'paraformer-realtime-v2', '阿里云百炼', '实时模型免费额度内（以控制台为准）', null),
     ...ACTIVE_CHAT_MODELS.map(m => {
       const s = u.perModel[m] || {};
