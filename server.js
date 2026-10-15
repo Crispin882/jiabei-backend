@@ -715,7 +715,7 @@ const MODEL_LIFECYCLE = {
   'qwen3.6-flash':           { status: 'stable',  note: '保底' },
   'paraformer-realtime-v2':  { status: 'stable',  note: '实时识别主力' },
   'qwen3-vl-plus':           { status: 'stable',  note: '视觉识别' },
-  'qwen-audio-3.0-tts-flash':{ status: 'stable',  note: '备用音源' },
+  'qwen-audio-3.0-tts-flash':{ status: 'retired', note: '已停用（2026-10-15）·按 token 计费无免费额度，/tts 已关闭，发音改用免费 Edge/百度/有道' },
   // 语音直连（Omni 音频大模型）：现役三款进池；停更/体验版一律标 sunset|retired 不进调用池
   'qwen3.5-omni-plus':       { status: 'stable',  note: '语音直连·旗舰·100万免费' },
   'qwen3.5-omni-flash':      { status: 'stable',  note: '语音直连·主力·100万免费' },
@@ -921,54 +921,21 @@ async function chatOmniAudio(messages, audioDataUri, tried) {
   return { text: String(content).trim(), model: model, usage: j.usage || null };
 }
 
-/* ---------- 整句 TTS：复用 DashScope key，合成整句英文（有道 dictvoice 不支持整句）---------- */
+/* ---------- 整句 TTS（DashScope qwen-audio）—— 已停用（2026-10-15 家长决定） ----------
+ * 前端发音链已移除 dashtts，现为纯免费：Edge(零key) → 百度(免key) → 有道(免key) → 本机音 → 逐词。
+ * 停用原因：
+ *   1) 该模型按 token 计费、**没有免费额度**，账户欠费后本接口直接 502 overdue-payment
+ *      （实测 2026-10-15：/tts 502 overdue-payment，而 /chat 正常 → 对话与 TTS 是两套独立计费）；
+ *   2) 它曾排在英文链第 2 位，Edge 一抖动就会去调它 → 既可能断音，又有意外费用风险。
+ * 保留这段代码只为**明确拒绝**并说明原因，避免有人再直接调用它产生费用。
+ * ⚠️ 若将来要恢复：需改前端 CLOUD_VOICES 加回 {id:'dashtts',kind:'dash'} 与 playCloud 的 dash 分支，
+ *    并确保阿里云账户正常（该模型不赠送免费额度）。
+ */
 app.get('/tts', async (req, res) => {
-  if (!API_KEY) return res.status(400).json({ error: 'no-key', message: '未配置 API_KEY，无法使用云端整句发音（请在 .env 配置 DashScope key，并已开通“语音合成”）' });
-  const text = String(req.query.text || '').slice(0, 500).trim();
-  if (!text) return res.status(400).json({ error: 'empty', message: '文本为空' });
-  const model = process.env.TTS_MODEL || 'qwen-audio-3.0-tts-flash';
-  const voice = process.env.TTS_VOICE || 'longanhuan_v3.6';
-  const host = process.env.TTS_HOST || 'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer';
-  try {
-    const r = await fetch(host, {
-      method: 'POST',
-      signal: AbortSignal.timeout(30000),
-      headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, input: { text }, parameters: { voice, format: 'wav', sample_rate: 24000 } })
-    });
-    const ct = r.headers.get('content-type') || '';
-    if (ct.includes('audio')) {
-      const buf = Buffer.from(await r.arrayBuffer());
-      res.set('Content-Type', ct.split(';')[0]);
-      try { recordUsage(model, null, false); } catch (_) {}                 // 模型池用量统计
-      return res.send(buf);
-    }
-    // 非流式可能返回 JSON（含 audio_url）或错误
-    const j = await r.json().catch(() => ({}));
-    if (j.code || j.error) {
-      const m = (j.error && (j.error.message || JSON.stringify(j.error))) || j.message || JSON.stringify(j);
-      throw new Error('云端 TTS 失败：' + m);
-    }
-    const audioObj = (j.output && j.output.audio) || {};
-    const audioUrl = audioObj.url || audioObj.data || j.audio_url || (j.output && j.output.audio_url);
-    if (audioUrl) {
-      if (/^data:/.test(audioUrl)) {
-        const b64 = audioUrl.split(',')[1] || '';
-        const buf = Buffer.from(b64, 'base64');
-        res.set('Content-Type', 'audio/wav');
-        try { recordUsage(model, null, false); } catch (_) {}               // 模型池用量统计
-        return res.send(buf);
-      }
-      const ar = await fetch(audioUrl);
-      const buf = Buffer.from(await ar.arrayBuffer());
-      res.set('Content-Type', ar.headers.get('content-type') || 'audio/wav');
-      try { recordUsage(model, null, false); } catch (_) {}                 // 模型池用量统计
-      return res.send(buf);
-    }
-    throw new Error('云端 TTS 未返回音频：' + JSON.stringify(j).slice(0, 200));
-  } catch (e) {
-    res.status(502).json({ error: 'tts-failed', message: e.message || String(e) });
-  }
+  return res.status(503).json({
+    error: 'tts-disabled',
+    message: '云端付费 TTS（阿里云 qwen-audio）已停用：该模型按 token 计费且无免费额度。发音已改用完全免费的 Edge 在线 TTS / 百度翻译 TTS / 有道，音质与稳定性不受影响。'
+  });
 });
 
 /* ---------- 免费 Edge TTS（零 key · 纯正美式 neural 音色 · 各设备一致） ----------
@@ -1294,7 +1261,7 @@ app.get('/chat-usage', (req, res) => {
         canDays: canDays > 365 ? '>1年' : (canDays + ' 天')
       });
     }),
-    mk('语音合成（备用音源）', process.env.TTS_MODEL || 'qwen-audio-3.0-tts-flash', '阿里云百炼', '备用；主用免费 Edge，几乎不消耗', process.env.TTS_MODEL || 'qwen-audio-3.0-tts-flash'),
+    // ⚠️ 付费 TTS（qwen-audio）已于 2026-10-15 停用，故不再出现在用量看板里 —— 发音全走免费 Edge。
     mk('语音合成（主用·纯正美音）', 'Edge TTS', '微软免费接口', '完全免费，无额度限制', null)
   ];
   res.json({
