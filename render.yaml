@@ -1,0 +1,17 @@
+# Render 一键部署蓝图：把本仓库连到 Render，自动 build+start，得到公网域名。
+# 用法：Render 控制台 → New → Blueprint → 选本仓库即可，无需手动填命令。
+services:
+  - type: web
+    name: jiabei-ocr
+    runtime: node
+    plan: free                 # 免费档；要常驻不休眠可改 starter（$7/月）
+    region: oregon             # 也可选 singapore；国内访问足够
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: PORT
+        value: "3000"          # Render 会覆盖为平台分配端口，这里仅作默认
