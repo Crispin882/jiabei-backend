@@ -1142,6 +1142,7 @@ app.get('/tts-edge', async (req, res) => {
   }
 
   // ① 首选：Cloudflare Worker 中转的 Edge TTS（纯正 neural 音）
+  let cfErr = '';
   try {
     const url = CF_TTS_URL + '/tts?text=' + encodeURIComponent(text) + '&voice=' + encodeURIComponent(voice) + '&rate=' + encodeURIComponent(rate);
     const buf = await fetchAudioBuffer(url, 20000);
@@ -1152,7 +1153,8 @@ app.get('/tts-edge', async (req, res) => {
     try { recordCall('Edge TTS(CF)'); } catch (_) {}
     return res.send(buf);
   } catch (e) {
-    console.log('[tts-edge] CF worker failed:', e.message);
+    cfErr = (e && e.message) || String(e);
+    console.log('[tts-edge] CF worker failed:', cfErr);
   }
 
   // ② 回落：本地 node-edge-tts（微软若解除对 Render 的风控可自动恢复）
@@ -1168,7 +1170,7 @@ app.get('/tts-edge', async (req, res) => {
     try { recordCall('Edge TTS'); } catch (_) {}
     return res.send(buf);
   } catch (e) {
-    res.status(502).json({ error: 'edge-failed', message: e.message || String(e) });
+    res.status(502).json({ error: 'edge-failed', message: (e.message || String(e)) + (cfErr ? ' | cf: ' + cfErr : '') });
   }
 });
 
