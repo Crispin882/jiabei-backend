@@ -982,6 +982,132 @@ async function edgeTTS(text, voice, rate) {
   }
 }
 
+/* ---------- 免费 TTS 代理（百度 / 有道）—— 修「浏览器直连第三方 TTS 全部失效」 ----------
+ * ⚠️ 2026-10-26 家长报「平板上完全没声音，一句一句跳很快」，实测根因：
+ *
+ *  ① **百度 TTS 遇第三方 Referer 返回 0 字节**（静默失败）
+ *     实测（同一 URL 只改 Referer）：
+ *       Referer=https://jiabeitai.app.workbuddy.host/ → 0 字节 / text/html  ❌
+ *       Referer=http://localhost/                    → 0 字节 / text/html  ❌
+ *       Referer=https://fanyi.baidu.com/              → 4536 字节 / audio/mpeg ✓
+ *       不带 Referer                                  → 4644 字节 / audio/mpeg ✓
+ *     百度只认**自家 Referer 或空 Referer**。而前端用 `<audio src>` 直连第三方，
+ *     浏览器按 strict-origin-when-cross-origin **必然带 Referer** → 浏览器里必挂。
+ *     → 24 个真实场景句实测：百度 **0/24** 全废。
+ *
+ *  ② **有道整句 TTS 不稳**：长句随机 500 `{"msg":"returned null audio"}`（分词失败，
+ *     与 UA 无关，type=1/2/3 全试过）→ 24 句实测仅 **5/24**；单词级则一直正常。
+ *
+ * 修法：**前端不再直连第三方，改由后端代理**。Node 的 fetch 默认**不发 Referer**
+ *      （实测百度整句 7668 字节正常、超长句 21276 字节正常）→ 这条路彻底通了。
+ * 设计：
+ *   - 主力 = 百度（整句可靠，中文必须 lan=zh）
+ *   - 备选 = 有道**逐词**拼接（单词级稳定；整句不可靠故不用）
+ *   - 两者都失败 → 404/502，前端自动切下一个音源
+ *   - 全部免费、零 key。
+ */
+const _ttsFreeRate = new Map(); // ip -> [timestamps]
+function ttsFreeRateOk(ip) {
+  const now = Date.now();
+  const arr = (_ttsFreeRate.get(ip) || []).filter(t => now - t < 60000);
+  if (arr.length >= 120) { _ttsFreeRate.set(ip, arr); return false; }   // 比 edge 宽松（兜底链路请求更多）
+  arr.push(now); _ttsFreeRate.set(ip, arr); return true;
+}
+// 文本清洗：与前端 sanitizeTTS 同口径（去掉会让有道 500 的标点）
+function sanitizeTTS(t) {
+  if (!t) return '';
+  return String(t)
+    .replace(/[,\;:\(\)\[\]\{\}<>]/g, ' ')
+    .replace(/[，；：（）《》、]/g, ' ')
+    .replace(/["“”‘’「」『』]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+// 判断是否含中文（决定百度 lan=zh / 有道中文单字）
+function hasCJK(t) {
+  return /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(String(t || ''));
+}
+// 从第三方取音频：严格校验「必须是真 mp3」，避免把 0 字节 / HTML / JSON 当成音频返回
+async function fetchAudioBuffer(url, timeoutMs) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs || 12000) });
+  const ct = String(r.headers.get('content-type') || '');
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (!r.ok) throw new Error('http ' + r.status);
+  if (!/audio|mpeg|mp3|octet-stream/i.test(ct)) {
+    // 有道失败时返回 application/json（{"msg":"returned null audio"}），百度 Referer 不对时返回 text/html
+    const preview = buf.subarray(0, 120).toString('utf8').replace(/\s+/g, ' ').slice(0, 80);
+    throw new Error('not-audio(' + ct.split(';')[0] + (preview ? ':' + preview : '') + ')');
+  }
+  if (!buf.length) throw new Error('empty-audio');
+  // mp3 魔数校验：ID3 标签 或 MPEG 帧同步头（0xFF Ex/Fx）
+  const isID3 = buf.length > 3 && buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33;
+  const isFrame = buf.length > 1 && buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0;
+  if (!isID3 && !isFrame) throw new Error('not-mp3');
+  return buf;
+}
+// 有道逐词：单词级稳定（整句不可靠）→ 依次取词并用 200ms 静音间隔拼接
+async function youdaoByWords(text) {
+  const words = sanitizeTTS(text).split(/\s+/).filter(Boolean);
+  if (!words.length) throw new Error('no-words');
+  if (words.length > 60) throw new Error('too-many-words');
+  const gap = Buffer.alloc(22050 / 5);   // ≈200ms 静音（16bit mono 22.05kHz）
+  const parts = [];
+  for (let i = 0; i < words.length; i++) {
+    const buf = await fetchAudioBuffer('https://dict.youdao.com/dictvoice?audio=' + encodeURIComponent(words[i]) + '&type=2', 9000);
+    if (i > 0) parts.push(gap);
+    parts.push(buf);
+  }
+  return Buffer.concat(parts);
+}
+app.get('/tts-free', async (req, res) => {
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '');
+  if (!ttsFreeRateOk(ip)) return res.status(429).json({ error: 'rate-limited', message: '请求过于频繁，请稍后再试' });
+  const kind = String(req.query.kind || 'baidu').toLowerCase();
+  const text = sanitizeTTS(String(req.query.text || '')).slice(0, 300);
+  if (!text) return res.status(400).json({ error: 'empty', message: '文本为空' });
+
+  // 缓存：同一句话重复朗读（连播/跟读/循环）很常见 → 命中即返回，省下游也稳
+  const cacheKey = 'ttsfree:' + kind + ':' + (hasCJK(text) ? 'zh' : 'en') + ':' + text;
+  const cached = freeCacheGet(cacheKey);
+  if (cached) {
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.set('X-TTS-Source', kind + '-cached');
+    return res.send(cached);
+  }
+
+  let buf = null, used = kind;
+  try {
+    if (kind === 'youdao') {
+      // 有道整句不可靠 → 直接走逐词
+      buf = await youdaoByWords(text);
+    } else {
+      // 百度主力：Node fetch 不发 Referer → 百度正常工作
+      const lan = hasCJK(text) ? 'zh' : 'en';
+      buf = await fetchAudioBuffer('https://fanyi.baidu.com/gettts?lan=' + lan + '&text=' + encodeURIComponent(text) + '&spd=5&source=web', 12000);
+    }
+  } catch (e) {
+    // 百度失败 → 兜底有道逐词（单词级稳定）
+    if (kind !== 'youdao') {
+      try {
+        buf = await youdaoByWords(text);
+        used = 'youdao-words';
+      } catch (e2) {
+        return res.status(502).json({ error: 'tts-free-failed', message: (e && e.message || String(e)) + ' | ' + (e2 && e2.message || String(e2)) });
+      }
+    } else {
+      return res.status(502).json({ error: 'tts-free-failed', message: e && e.message || String(e) });
+    }
+  }
+  if (!buf || !buf.length) return res.status(502).json({ error: 'tts-free-empty', message: '未取到音频' });
+  try { freeCacheSet(cacheKey, buf); } catch (_) {}
+  res.set('Content-Type', 'audio/mpeg');
+  res.set('Cache-Control', 'public, max-age=86400');
+  res.set('X-TTS-Source', used);
+  try { recordCall('免费 TTS 代理(' + used + ')'); } catch (_) {}
+  return res.send(buf);
+});
+
 /* 免费 Edge TTS 端点（零 key）。前端整句朗读/听优先调用此端点。 */
 const _edgeRate = new Map(); // ip -> [timestamps]
 function edgeRateOk(ip) {
