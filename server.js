@@ -1108,7 +1108,12 @@ app.get('/tts-free', async (req, res) => {
   return res.send(buf);
 });
 
-/* 免费 Edge TTS 端点（零 key）。前端整句朗读/听优先调用此端点。 */
+/* 免费 Edge TTS 端点（零 key）。前端整句朗读/听优先调用此端点。
+ * 链路（2026-10-27）：微软风控 Render 出口 IP → node-edge-tts 在 Render 必挂；
+ * 改为先调 Cloudflare Worker 中转的 Edge TTS（CF 出口 IP 池大，未被风控，实测出音频）。
+ * workers.dev 在国内被 DNS 污染/SNI 封锁 → 前端不直连 Worker，一律经本后端（海外）代理。
+ * Worker 失败再回落本地 node-edge-tts（万一微软解除风控可自动恢复）。 */
+const CF_TTS_URL = String(process.env.CF_TTS_URL || 'https://jiabei-tts.crispin-xs.workers.dev').replace(/\/+$/, '');
 const _edgeRate = new Map(); // ip -> [timestamps]
 function edgeRateOk(ip) {
   const now = Date.now();
@@ -1117,7 +1122,6 @@ function edgeRateOk(ip) {
   arr.push(now); _edgeRate.set(ip, arr); return true;
 }
 app.get('/tts-edge', async (req, res) => {
-  if (!EDGE_AVAILABLE) return res.status(503).json({ error: 'edge-tts-unavailable', message: '后端未安装 node-edge-tts，无法使用 Edge TTS（请执行 npm install node-edge-tts 后重新部署）' });
   const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '');
   if (!edgeRateOk(ip)) return res.status(429).json({ error: 'rate-limited', message: '请求过于频繁，请稍后再试' });
   const text = String(req.query.text || '').slice(0, 500).trim();
@@ -1126,11 +1130,40 @@ app.get('/tts-edge', async (req, res) => {
   if (!_edgeVoiceRe.test(voice)) voice = 'en-US-AriaNeural';
   let rate = String(req.query.rate || '-15%').slice(0, 8).trim();
   if (!/^[+-]?\d{1,2}%$/.test(rate)) rate = '-15%';   // 儿童学习默认放慢 15%；允许 +10% / 10% / -8% 三种写法
+
+  // 缓存：同一句连播/跟读/循环很常见 → 命中直接返回（与 /tts-free 同一套缓存）
+  const cacheKey = 'ttsedge:' + voice + ':' + rate + ':' + text;
+  const cached = freeCacheGet(cacheKey);
+  if (cached) {
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.set('X-TTS-Source', 'edge-cf-cached');
+    return res.send(cached);
+  }
+
+  // ① 首选：Cloudflare Worker 中转的 Edge TTS（纯正 neural 音）
+  try {
+    const url = CF_TTS_URL + '/tts?text=' + encodeURIComponent(text) + '&voice=' + encodeURIComponent(voice) + '&rate=' + encodeURIComponent(rate);
+    const buf = await fetchAudioBuffer(url, 20000);
+    freeCacheSet(cacheKey, buf);
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.set('X-TTS-Source', 'edge-cf');
+    try { recordCall('Edge TTS(CF)'); } catch (_) {}
+    return res.send(buf);
+  } catch (e) {
+    console.log('[tts-edge] CF worker failed:', e.message);
+  }
+
+  // ② 回落：本地 node-edge-tts（微软若解除对 Render 的风控可自动恢复）
+  if (!EDGE_AVAILABLE) return res.status(502).json({ error: 'edge-failed', message: 'CF Worker 与 node-edge-tts 均不可用（后者未安装）' });
   try {
     const buf = await edgeTTS(text, voice, rate);
     if (!buf || !buf.length) return res.status(502).json({ error: 'edge-empty', message: 'Edge TTS 未返回音频' });
+    freeCacheSet(cacheKey, buf);
     res.set('Content-Type', 'audio/mpeg');
     res.set('Cache-Control', 'public, max-age=86400');
+    res.set('X-TTS-Source', 'edge-local');
     // 记账：Edge 是免费服务（无 token 概念），但家长要能看到"到底用了多少次"→ 只记 calls
     try { recordCall('Edge TTS'); } catch (_) {}
     return res.send(buf);
